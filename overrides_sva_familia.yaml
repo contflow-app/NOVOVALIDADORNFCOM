@@ -1,9 +1,0 @@
-# overrides_sva_familia.yaml
-# Chave = descrição normalizada (sem acentos, minúscula).
-#
-# Exemplo:
-# "box tv adicional":
-#   familia: "SVA_LOCACAO"
-
-"box tv adicional":
-  familia: "SVA_LOCACAO"
