@@ -21,30 +21,18 @@ LOGO_PATH = "Logo-Contare-ISP-1.png"
 # ====================================================
 
 def get_ns(tree: etree._ElementTree) -> Dict[str, str]:
+    """Retorna dict de namespaces para XPath.
+    Padrão: {'n': <uri>} quando o XML usa namespace; caso contrário {}.
     """
-    Retorna o namespace padrão do NFCom mapeado como prefixo 'n'.
-    """
-    root = tree.getroot()
+    try:
+        root = tree.getroot()
+    except Exception:
+        return {}
+    m = re.match(r"\{(.*)\}", root.tag)
+    if m:
+        return {"n": m.group(1)}
+    return {}
 
-    emit_info = extract_emitente_info(tree)
-    emit_doc = emit_info.get('emit_doc','')
-    emit_xNome = emit_info.get('emit_xNome','')
-    default_ns = root.nsmap.get(None)
-    return {"n": default_ns} if default_ns else {}
-
-
-# ====================================================
-# Configuração
-# ====================================================
-
-st.set_page_config(page_title="Validador NFCom 62 - Contare", layout="wide")
-
-
-# ====================================================
-# Leitura de arquivos de configuração
-# ====================================================
-
-@st.cache_data
 def load_rules(path: str = "rules.yaml") -> List[Dict[str, Any]]:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -796,6 +784,10 @@ def extract_item_details(tree, file_name, cclass_cfg: Dict[str, Any]) -> List[Di
     itens = []
     ns = get_ns(tree)
     root = tree.getroot()
+
+    emit_info = extract_emitente_info(tree)
+    emit_doc = emit_info.get('emit_doc','')
+    emit_xNome = emit_info.get('emit_xNome','')
     dets = root.xpath(".//n:det", namespaces=ns) if ns else root.xpath(".//det")
 
     for det in dets:
@@ -1518,163 +1510,163 @@ def main():
 
         # Monta DataFrames globais de itens
         df_itens = pd.DataFrame(itens_detalhe) if itens_detalhe else pd.DataFrame()
-        # ====================================================
-        # Classificação por FAMÍLIA SVA (somente relatório)
-        # ====================================================
-        df_familia = pd.DataFrame()
-        df_familia_item = pd.DataFrame()
-        df_reinc = pd.DataFrame()
-        df_rev_fam = pd.DataFrame()
+# ====================================================
+# Classificação por FAMÍLIA SVA (somente relatório)
+# ====================================================
+df_familia = pd.DataFrame()
+df_familia_item = pd.DataFrame()
+df_reinc = pd.DataFrame()
+df_rev_fam = pd.DataFrame()
 
-        if usar_familias_sva and (not df_itens.empty):
-            fam_rows = []
-            for _, row in df_itens.iterrows():
-                info = classify_sva_family(
-                    row.get("descricao",""),
-                    row.get("class_final_sugerida",""),
-                    sva_cfg,
-                    overrides_fam
-                )
-                fam_rows.append(info)
+if usar_familias_sva and (not df_itens.empty):
+    fam_rows = []
+    for _, row in df_itens.iterrows():
+        info = classify_sva_family(
+            row.get("descricao",""),
+            row.get("class_final_sugerida",""),
+            sva_cfg,
+            overrides_fam
+        )
+        fam_rows.append(info)
 
-            df_fam_info = pd.DataFrame(fam_rows).fillna("")
-            df_itens["familia_sugerida"] = df_fam_info.get("familia_sugerida", "")
-            df_itens["familia_conf"] = df_fam_info.get("familia_conf", 0.0)
-            df_itens["familia_motivo"] = df_fam_info.get("familia_motivo", "")
-            df_itens["familia_origem"] = df_fam_info.get("familia_origem", "")
-            df_itens["familia_status"] = df_fam_info.get("familia_status", "")
-            df_itens["familia_key_norm"] = df_fam_info.get("key_norm", "")
-            df_itens["familia_final"] = ""
-            df_itens["familia_obs"] = ""
+    df_fam_info = pd.DataFrame(fam_rows).fillna("")
+    df_itens["familia_sugerida"] = df_fam_info.get("familia_sugerida", "")
+    df_itens["familia_conf"] = df_fam_info.get("familia_conf", 0.0)
+    df_itens["familia_motivo"] = df_fam_info.get("familia_motivo", "")
+    df_itens["familia_origem"] = df_fam_info.get("familia_origem", "")
+    df_itens["familia_status"] = df_fam_info.get("familia_status", "")
+    df_itens["familia_key_norm"] = df_fam_info.get("key_norm", "")
+    df_itens["familia_final"] = ""
+    df_itens["familia_obs"] = ""
 
-            if usar_gpt_baixa_confianca:
-                import os as _os
-                has_key = bool(_os.getenv("OPENAI_API_KEY"))
-                if not has_key:
-                    st.warning("OPENAI_API_KEY não encontrada (Secrets). GPT desativado.")
-                else:
-                    df_low = df_itens[
-                        (df_itens["class_final_sugerida"].astype(str).str.upper() == "SVA") &
-                        (pd.to_numeric(df_itens["familia_conf"], errors="coerce").fillna(0.0) < limiar_gpt)
-                    ].copy()
-                    unique_desc = list(dict.fromkeys(df_low["descricao"].astype(str).tolist()))
-                    if unique_desc:
-                        with st.spinner("Consultando GPT para sugestões de família (baixa confiança)..."):
-                            gpt_map = gpt_classify_familias(unique_desc, gpt_model)
-                        if gpt_map:
-                            df_itens["gpt_familia"] = df_itens["descricao"].astype(str).map(lambda d: (gpt_map.get(d) or {}).get("familia",""))
-                            df_itens["gpt_conf"] = df_itens["descricao"].astype(str).map(lambda d: (gpt_map.get(d) or {}).get("conf",""))
-                            df_itens["gpt_motivo"] = df_itens["descricao"].astype(str).map(lambda d: (gpt_map.get(d) or {}).get("motivo",""))
-
-                            def _pick(row):
-                                fam = row.get("familia_sugerida","")
-                                conf = float(row.get("familia_conf") or 0.0)
-                                gfam = (row.get("gpt_familia") or "").strip()
-                                try:
-                                    gconf = float(row.get("gpt_conf") or 0.0)
-                                except Exception:
-                                    gconf = 0.0
-                                if gfam and gconf > conf:
-                                    return gfam, gconf, "GPT_FALLBACK"
-                                return fam, conf, row.get("familia_origem","")
-
-                            picked = df_itens.apply(lambda r: _pick(r), axis=1, result_type="expand")
-                            df_itens["familia_sugerida"] = picked[0]
-                            df_itens["familia_conf"] = picked[1]
-                            df_itens["familia_origem"] = picked[2]
-
-            df_tmp = df_itens.copy()
-            df_tmp["familia_eff"] = df_tmp["familia_final"].where(df_tmp["familia_final"].astype(str).str.strip() != "", df_tmp["familia_sugerida"])
-
-            df_familia = (
-                df_tmp.groupby(["familia_eff"])
-                .agg(qtd_itens=("arquivo","count"), total_vServ=("vServ","sum"))
-                .reset_index()
-                .rename(columns={"familia_eff":"familia"})
-                .sort_values("total_vServ", ascending=False)
-            )
-
-            df_familia_item = (
-                df_tmp.groupby(["familia_eff","descricao"])
-                .agg(qtd_itens=("arquivo","count"), total_vServ=("vServ","sum"))
-                .reset_index()
-                .rename(columns={"familia_eff":"familia"})
-            )
-
-            if "emit_doc" in df_tmp.columns:
-                df_tmp["divergencia_scm_sva"] = (
-                    df_tmp["class_desc"].astype(str).str.upper() != df_tmp["class_cclass"].astype(str).str.upper()
-                )
-                df_reinc = (
-                    df_tmp.groupby(["emit_doc","emit_xNome"])
-                    .agg(
-                        xmls=("arquivo","nunique"),
-                        itens=("arquivo","count"),
-                        divergencias=("divergencia_scm_sva","sum"),
-                        baixa_confianca=("familia_conf", lambda s: (pd.to_numeric(s, errors="coerce").fillna(0.0) < limiar_gpt).sum()),
-                        total_vServ=("vServ","sum"),
-                    )
-                    .reset_index()
-                )
-                df_reinc["pct_divergencia"] = df_reinc["divergencias"] / df_reinc["itens"].replace(0, 1)
-                df_reinc = df_reinc.sort_values(["pct_divergencia","baixa_confianca","total_vServ"], ascending=[False, False, False])
-
-            st.subheader("🧠 Revisão – Famílias SVA (relatório)")
-            st.caption("Aprovação gera overrides para download/commit. Não altera o XML.")
-
-            df_rev = df_itens[
+    if usar_gpt_baixa_confianca:
+        import os as _os
+        has_key = bool(_os.getenv("OPENAI_API_KEY"))
+        if not has_key:
+            st.warning("OPENAI_API_KEY não encontrada (Secrets). GPT desativado.")
+        else:
+            df_low = df_itens[
                 (df_itens["class_final_sugerida"].astype(str).str.upper() == "SVA") &
-                (
-                    (df_itens["familia_sugerida"].astype(str).str.upper() == "SVA_OUTROS") |
-                    (pd.to_numeric(df_itens["familia_conf"], errors="coerce").fillna(0.0) < limiar_gpt)
-                )
+                (pd.to_numeric(df_itens["familia_conf"], errors="coerce").fillna(0.0) < limiar_gpt)
             ].copy()
+            unique_desc = list(dict.fromkeys(df_low["descricao"].astype(str).tolist()))
+            if unique_desc:
+                with st.spinner("Consultando GPT para sugestões de família (baixa confiança)..."):
+                    gpt_map = gpt_classify_familias(unique_desc, gpt_model)
+                if gpt_map:
+                    df_itens["gpt_familia"] = df_itens["descricao"].astype(str).map(lambda d: (gpt_map.get(d) or {}).get("familia",""))
+                    df_itens["gpt_conf"] = df_itens["descricao"].astype(str).map(lambda d: (gpt_map.get(d) or {}).get("conf",""))
+                    df_itens["gpt_motivo"] = df_itens["descricao"].astype(str).map(lambda d: (gpt_map.get(d) or {}).get("motivo",""))
 
-            if df_rev.empty:
-                st.success("Sem pendências relevantes para famílias SVA.")
+                    def _pick(row):
+                        fam = row.get("familia_sugerida","")
+                        conf = float(row.get("familia_conf") or 0.0)
+                        gfam = (row.get("gpt_familia") or "").strip()
+                        try:
+                            gconf = float(row.get("gpt_conf") or 0.0)
+                        except Exception:
+                            gconf = 0.0
+                        if gfam and gconf > conf:
+                            return gfam, gconf, "GPT_FALLBACK"
+                        return fam, conf, row.get("familia_origem","")
+
+                    picked = df_itens.apply(lambda r: _pick(r), axis=1, result_type="expand")
+                    df_itens["familia_sugerida"] = picked[0]
+                    df_itens["familia_conf"] = picked[1]
+                    df_itens["familia_origem"] = picked[2]
+
+    df_tmp = df_itens.copy()
+    df_tmp["familia_eff"] = df_tmp["familia_final"].where(df_tmp["familia_final"].astype(str).str.strip() != "", df_tmp["familia_sugerida"])
+
+    df_familia = (
+        df_tmp.groupby(["familia_eff"])
+        .agg(qtd_itens=("arquivo","count"), total_vServ=("vServ","sum"))
+        .reset_index()
+        .rename(columns={"familia_eff":"familia"})
+        .sort_values("total_vServ", ascending=False)
+    )
+
+    df_familia_item = (
+        df_tmp.groupby(["familia_eff","descricao"])
+        .agg(qtd_itens=("arquivo","count"), total_vServ=("vServ","sum"))
+        .reset_index()
+        .rename(columns={"familia_eff":"familia"})
+    )
+
+    if "emit_doc" in df_tmp.columns:
+        df_tmp["divergencia_scm_sva"] = (
+            df_tmp["class_desc"].astype(str).str.upper() != df_tmp["class_cclass"].astype(str).str.upper()
+        )
+        df_reinc = (
+            df_tmp.groupby(["emit_doc","emit_xNome"])
+            .agg(
+                xmls=("arquivo","nunique"),
+                itens=("arquivo","count"),
+                divergencias=("divergencia_scm_sva","sum"),
+                baixa_confianca=("familia_conf", lambda s: (pd.to_numeric(s, errors="coerce").fillna(0.0) < limiar_gpt).sum()),
+                total_vServ=("vServ","sum"),
+            )
+            .reset_index()
+        )
+        df_reinc["pct_divergencia"] = df_reinc["divergencias"] / df_reinc["itens"].replace(0, 1)
+        df_reinc = df_reinc.sort_values(["pct_divergencia","baixa_confianca","total_vServ"], ascending=[False, False, False])
+
+    st.subheader("🧠 Revisão – Famílias SVA (relatório)")
+    st.caption("Aprovação gera overrides para download/commit. Não altera o XML.")
+
+    df_rev = df_itens[
+        (df_itens["class_final_sugerida"].astype(str).str.upper() == "SVA") &
+        (
+            (df_itens["familia_sugerida"].astype(str).str.upper() == "SVA_OUTROS") |
+            (pd.to_numeric(df_itens["familia_conf"], errors="coerce").fillna(0.0) < limiar_gpt)
+        )
+    ].copy()
+
+    if df_rev.empty:
+        st.success("Sem pendências relevantes para famílias SVA.")
+    else:
+        cols_rev = ["emit_doc","emit_xNome","arquivo","cClass","descricao","vServ","familia_sugerida","familia_conf","familia_origem","familia_motivo","familia_final","familia_obs"]
+        for c in cols_rev:
+            if c not in df_rev.columns:
+                df_rev[c] = ""
+
+        edited = st.data_editor(
+            df_rev[cols_rev],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "familia_final": st.column_config.SelectboxColumn(
+                    "Família final",
+                    options=["","SVA_EBOOK","SVA_LOCACAO","SVA_TV_STREAMING","SVA_OUTROS"],
+                    required=False
+                ),
+                "familia_conf": st.column_config.NumberColumn("Conf", format="%.2f"),
+                "vServ": st.column_config.NumberColumn("vServ", format="%.2f"),
+            }
+        )
+
+        if st.button("Gerar overrides (download)", type="primary"):
+            updates = {}
+            for _, r in edited.iterrows():
+                fam = (r.get("familia_final") or "").strip()
+                if fam:
+                    key = normalize_text(r.get("descricao",""))
+                    updates[key] = fam
+
+            if not updates:
+                st.warning("Nenhuma família final preenchida para salvar.")
             else:
-                cols_rev = ["emit_doc","emit_xNome","arquivo","cClass","descricao","vServ","familia_sugerida","familia_conf","familia_origem","familia_motivo","familia_final","familia_obs"]
-                for c in cols_rev:
-                    if c not in df_rev.columns:
-                        df_rev[c] = ""
-
-                edited = st.data_editor(
-                    df_rev[cols_rev],
-                    use_container_width=True,
-                    hide_index=True,
-                    column_config={
-                        "familia_final": st.column_config.SelectboxColumn(
-                            "Família final",
-                            options=["","SVA_EBOOK","SVA_LOCACAO","SVA_TV_STREAMING","SVA_OUTROS"],
-                            required=False
-                        ),
-                        "familia_conf": st.column_config.NumberColumn("Conf", format="%.2f"),
-                        "vServ": st.column_config.NumberColumn("vServ", format="%.2f"),
-                    }
+                merged = merge_overrides(overrides_fam, updates)
+                yaml_out = dump_overrides_yaml(merged)
+                st.download_button(
+                    "Baixar overrides_sva_familia.yaml",
+                    data=yaml_out.encode("utf-8"),
+                    file_name="overrides_sva_familia.yaml",
+                    mime="text/yaml"
                 )
+                st.success("Overrides gerados. Faça commit no repositório para versionar.")
 
-                if st.button("Gerar overrides (download)", type="primary"):
-                    updates = {}
-                    for _, r in edited.iterrows():
-                        fam = (r.get("familia_final") or "").strip()
-                        if fam:
-                            key = normalize_text(r.get("descricao",""))
-                            updates[key] = fam
-
-                    if not updates:
-                        st.warning("Nenhuma família final preenchida para salvar.")
-                    else:
-                        merged = merge_overrides(overrides_fam, updates)
-                        yaml_out = dump_overrides_yaml(merged)
-                        st.download_button(
-                            "Baixar overrides_sva_familia.yaml",
-                            data=yaml_out.encode("utf-8"),
-                            file_name="overrides_sva_familia.yaml",
-                            mime="text/yaml"
-                        )
-                        st.success("Overrides gerados. Faça commit no repositório para versionar.")
-
-                df_rev_fam = df_rev.copy()
+        df_rev_fam = df_rev.copy()
 
 
         # Propostas de reclassificação SCM/SVA (para revisão, apenas sugestões fortes)
