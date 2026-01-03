@@ -24,6 +24,14 @@ TRAINING_CSV = os.path.join("data", "training_data.csv")
 CATEGORIES = ["SCM", "SVA_EBOOK", "SVA_LOCACAO", "SVA_TV_STREAMING", "SVA_OUTROS"]
 AI_ALLOWED = set(CATEGORIES)
 
+# cClass alerta
+ALERTA_CCLASS = "1100101"
+ALERTA_TEXTO = (
+    "⚠️ Atenção: Foi identificado cClass **1100101** no lote. "
+    "Esse cClass indica que o item demonstrado na NFCom foi faturado por outra empresa do grupo econômico ou terceiros. "
+    "É obrigatório o colaborador verificar esta situação antes de concluir o fechamento."
+)
+
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 
 
@@ -302,36 +310,79 @@ def training_append(rows: List[Dict[str, Any]]):
 def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
     """
     Aceita:
-      - CSV interno: emit_cnpj, desc_norm, categoria_aprovada, ...
-      - CSV/XLSX simples: CNPJ | descricao | CLASSIFICACAO VALIDADA
-        (CLASSIFICACAO VALIDADA: SCM / SVA / SVA_EBOOK / SVA_LOCACAO / SVA_TV_STREAMING / SVA_OUTROS)
+      - Interno: emit_cnpj, desc_norm, categoria_aprovada
+      - Simples (com CNPJ): CNPJ | descricao | CLASSIFICACAO VALIDADA
+      - Simples (sem CNPJ): descricao | categoria_fiscal_ia (ou variações)
+    Também tenta detectar header quando o Excel vem com colunas "Unnamed".
     """
     training_init()
 
     name = (getattr(uploaded_file, "name", "") or "").lower()
     data = uploaded_file.read()
 
-    try:
+    def _read_any() -> pd.DataFrame:
         if name.endswith(".xlsx"):
-            df_in = pd.read_excel(io.BytesIO(data), dtype=str).fillna("")
-        else:
-            df_in = pd.read_csv(io.BytesIO(data), dtype=str).fillna("")
+            return pd.read_excel(io.BytesIO(data), dtype=str).fillna("")
+        return pd.read_csv(io.BytesIO(data), dtype=str).fillna("")
+
+    def _read_with_header_row(header_row: int) -> pd.DataFrame:
+        if name.endswith(".xlsx"):
+            return pd.read_excel(io.BytesIO(data), dtype=str, header=header_row).fillna("")
+        return pd.read_csv(io.BytesIO(data), dtype=str, header=header_row).fillna("")
+
+    def _norm_cols(df: pd.DataFrame) -> pd.DataFrame:
+        cols_raw = {c: normalize_text(str(c)).replace(" ", "_") for c in df.columns}
+        return df.rename(columns=cols_raw)
+
+    try:
+        df_in = _read_any()
     except Exception as e:
         return False, f"Arquivo inválido (não consegui ler). Erro: {e}"
 
-    cols_raw = {c: normalize_text(str(c)).replace(" ", "_") for c in df_in.columns}
-    df_in = df_in.rename(columns=cols_raw)
+    df_in = _norm_cols(df_in)
+
+    # tenta detectar header interno
+    if all(str(c).startswith("unnamed") for c in df_in.columns) or len(df_in.columns) <= 2:
+        if name.endswith(".xlsx"):
+            df_raw = pd.read_excel(io.BytesIO(data), dtype=str, header=None).fillna("")
+        else:
+            df_raw = pd.read_csv(io.BytesIO(data), dtype=str, header=None).fillna("")
+
+        header_idx = None
+        for i in range(min(10, len(df_raw))):
+            row = " ".join([normalize_text(x) for x in df_raw.iloc[i].astype(str).tolist()])
+            if "descricao" in row and ("categoria" in row or "classificacao" in row):
+                header_idx = i
+                break
+
+        if header_idx is not None:
+            try:
+                df_in = _read_with_header_row(header_idx)
+                df_in = _norm_cols(df_in)
+            except Exception:
+                pass
+
+    def pick_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+        for c in candidates:
+            if c in df.columns:
+                return c
+        return None
+
+    col_cnpj = pick_col(df_in, ["cnpj", "cpf", "emit_cnpj"])
+    col_desc = pick_col(df_in, ["descricao", "descrição", "xprod", "produto", "servico", "serviço"])
+    col_class = pick_col(
+        df_in,
+        [
+            "classificacao_validada",
+            "classificacao",
+            "classificação",
+            "categoria_fiscal_ia",
+            "categoria",
+            "categoria_aprovada",
+        ],
+    )
 
     is_internal = {"emit_cnpj", "desc_norm", "categoria_aprovada"}.issubset(set(df_in.columns))
-    is_simple = {"cnpj", "descricao", "classificacao_validada"}.issubset(set(df_in.columns))
-
-    if not is_internal and not is_simple:
-        return False, (
-            "Layout não reconhecido. Aceito:\n"
-            "1) Interno: emit_cnpj, desc_norm, categoria_aprovada\n"
-            "2) Simples: CNPJ, descricao, CLASSIFICACAO VALIDADA"
-        )
-
     now = datetime.now().isoformat(timespec="seconds")
 
     if is_internal:
@@ -344,9 +395,23 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
         df_norm["created_at"] = df_norm.get("created_at", now)
         df_norm["source"] = df_norm.get("source", "importado")
     else:
+        if not col_desc or not col_class:
+            return False, (
+                "Layout não reconhecido.\n\n"
+                "Aceito:\n"
+                "1) Interno: emit_cnpj, desc_norm, categoria_aprovada\n"
+                "2) Simples: CNPJ, descricao, CLASSIFICACAO VALIDADA\n"
+                "3) Simples sem CNPJ: descricao, categoria_fiscal_ia (ou 'categoria')\n\n"
+                f"Colunas encontradas: {list(df_in.columns)}"
+            )
+
         df_norm = pd.DataFrame()
-        df_norm["emit_cnpj"] = df_in["cnpj"].astype(str).str.replace(r"\D+", "", regex=True)
-        df_norm["descricao_exemplo"] = df_in["descricao"].astype(str)
+        if col_cnpj and col_cnpj in df_in.columns:
+            df_norm["emit_cnpj"] = df_in[col_cnpj].astype(str).str.replace(r"\D+", "", regex=True)
+        else:
+            df_norm["emit_cnpj"] = ""
+
+        df_norm["descricao_exemplo"] = df_in[col_desc].astype(str)
         df_norm["desc_norm"] = df_norm["descricao_exemplo"].map(normalize_text)
 
         def map_cat(x: str) -> str:
@@ -362,9 +427,9 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
                 return "SVA_OUTROS"
             return "SVA_OUTROS"
 
-        df_norm["categoria_aprovada"] = df_in["classificacao_validada"].astype(str).map(map_cat)
+        df_norm["categoria_aprovada"] = df_in[col_class].astype(str).map(map_cat)
         df_norm["created_at"] = now
-        df_norm["source"] = "importado_xlsx_simples"
+        df_norm["source"] = "importado_simples_auto"
 
     df_norm = df_norm.replace({None: ""}).fillna("")
     df_norm = df_norm[df_norm["desc_norm"].astype(str).str.len() > 0]
@@ -383,7 +448,7 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
 
 
 # =========================================================
-# Heuristic classifier
+# Heuristic classifier (fallback)
 # =========================================================
 SCM_KEYWORDS = [
     "fibra",
@@ -449,9 +514,9 @@ def heuristic_category(desc: str) -> Tuple[str, float, str]:
 
 
 # =========================================================
-# OpenAI classifier (robust parsing)
+# OpenAI (item-level) + OpenAI (consolidated-level)
 # =========================================================
-AI_SYSTEM = """Você é um classificador fiscal para itens de NFCom (Modelo 62).
+AI_SYSTEM_ITEM = """Você é um classificador fiscal para itens de NFCom (Modelo 62).
 Classifique cada item em UMA categoria:
 - SCM
 - SVA_EBOOK
@@ -468,6 +533,25 @@ Regras:
 Retorne SOMENTE JSON válido.
 """
 
+AI_SYSTEM_CONSOL = """Você é um especialista fiscal em NFCom (Modelo 62) para escritório contábil.
+Você vai classificar ITENS CONSOLIDADOS (mesma descrição repetida em vários XMLs) em UMA categoria:
+- SCM
+- SVA_EBOOK
+- SVA_LOCACAO
+- SVA_TV_STREAMING
+- SVA_OUTROS
+
+SINAIS IMPORTANTES (use em conjunto):
+- DESCRIÇÃO: pode indicar o serviço.
+- cClass: é um sinal fiscal forte do emissor. Se descrição e cClass divergirem, BAIXE a confiança.
+- CFOP: somente SCM deve ter CFOP. Itens SVA devem ter CFOP ausente/zerado (conforme regra do escritório).
+
+REGRAS DE SEGURANÇA:
+- Só sugira uma mudança forte se tiver alta confiança (>=0.90).
+- Se houver ambiguidade, retorne SVA_OUTROS com confiança baixa e explique a dúvida.
+Retorne SOMENTE JSON válido.
+"""
+
 
 def get_openai_client():
     key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
@@ -477,122 +561,100 @@ def get_openai_client():
     return OpenAI(api_key=key)
 
 
-def ai_classify_batch(items: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
+def _strip_fences(t: str) -> str:
+    t = (t or "").strip()
+    t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
+    t = re.sub(r"\s*```$", "", t)
+    return t.strip()
+
+
+def _extract_json_object(t: str) -> Optional[str]:
+    t = _strip_fences(t)
+    start = t.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(t)):
+        ch = t[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        else:
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return t[start : i + 1]
+    return None
+
+
+def _safe_json_loads(t: str) -> Optional[dict]:
+    t = _strip_fences(t)
+    try:
+        obj = json.loads(t)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    js = _extract_json_object(t)
+    if not js:
+        return None
+    js_fixed = js.replace("\u201c", '"').replace("\u201d", '"')
+    js_fixed = re.sub(r",\s*([}\]])", r"\1", js_fixed)
+    try:
+        obj = json.loads(js_fixed)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        return None
+    return None
+
+
+def ai_classify_batch_items(items: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
+    """
+    Item-level (para quando heurística não for suficiente)
+    """
     client = get_openai_client()
     if client is None:
         out = []
         for it in items:
             cat, conf, why = heuristic_category(it.get("desc", ""))
             out.append(
-                {
-                    "id": it.get("id"),
-                    "categoria_fiscal_ia": cat,
-                    "confianca_ia": float(conf),
-                    "motivo_ia": f"Sem OpenAI. Heurística: {why}",
-                    "origem": "heuristica",
-                }
+                {"id": it.get("id"), "categoria_fiscal_ia": cat, "confianca_ia": float(conf), "motivo_ia": f"Sem OpenAI. Heurística: {why}", "origem": "heuristica"}
             )
         return out
 
     payload = [
-        {
-            "id": it.get("id"),
-            "descricao": (it.get("desc") or "")[:220],
-            "cClass": (it.get("cClass") or "")[:32],
-            "CFOP": (it.get("cfop") or "")[:16],
-        }
+        {"id": it.get("id"), "descricao": (it.get("desc") or "")[:220], "cClass": (it.get("cClass") or "")[:32], "CFOP": (it.get("cfop") or "")[:16]}
         for it in items
     ]
-    user_msg = {"items": payload}
 
     resp = client.responses.create(
         model=model,
         input=[
-            {"role": "system", "content": AI_SYSTEM},
-            {
-                "role": "user",
-                "content": (
-                    "Classifique os itens abaixo. Retorne SOMENTE JSON válido no formato:\n"
-                    '{"items":[{"id":"...","categoria_fiscal_ia":"SCM|SVA_EBOOK|SVA_LOCACAO|SVA_TV_STREAMING|SVA_OUTROS",'
-                    '"confianca_ia":0.0-1.0,"motivo_ia":"..."}]}\n\n'
-                    + json.dumps(user_msg, ensure_ascii=False)
-                ),
-            },
+            {"role": "system", "content": AI_SYSTEM_ITEM},
+            {"role": "user", "content": "Retorne SOMENTE JSON válido no formato {\"items\":[...]}.\n\n" + json.dumps({"items": payload}, ensure_ascii=False)},
         ],
         temperature=0.0,
-        max_output_tokens=1400,
+        max_output_tokens=1600,
     )
 
-    raw_text = (resp.output_text or "").strip()
-
-    def _strip_fences(t: str) -> str:
-        t = (t or "").strip()
-        t = re.sub(r"^```(?:json)?\s*", "", t, flags=re.I)
-        t = re.sub(r"\s*```$", "", t)
-        return t.strip()
-
-    def _extract_json_object(t: str) -> Optional[str]:
-        t = _strip_fences(t)
-        start = t.find("{")
-        if start < 0:
-            return None
-        depth = 0
-        in_str = False
-        esc = False
-        for i in range(start, len(t)):
-            ch = t[i]
-            if in_str:
-                if esc:
-                    esc = False
-                elif ch == "\\":
-                    esc = True
-                elif ch == '"':
-                    in_str = False
-            else:
-                if ch == '"':
-                    in_str = True
-                elif ch == "{":
-                    depth += 1
-                elif ch == "}":
-                    depth -= 1
-                    if depth == 0:
-                        return t[start : i + 1]
-        return None
-
-    def _safe_json_loads(t: str) -> Optional[dict]:
-        t = _strip_fences(t)
-        try:
-            obj = json.loads(t)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            pass
-        js = _extract_json_object(t)
-        if not js:
-            return None
-        js_fixed = js.replace("\u201c", '"').replace("\u201d", '"')
-        js_fixed = re.sub(r",\s*([}\]])", r"\1", js_fixed)
-        try:
-            obj = json.loads(js_fixed)
-            if isinstance(obj, dict):
-                return obj
-        except Exception:
-            return None
-        return None
-
-    data = _safe_json_loads(raw_text)
+    data = _safe_json_loads((resp.output_text or "").strip())
     if not data or "items" not in data:
         out = []
         for it in items:
             cat, conf, why = heuristic_category(it.get("desc", ""))
             out.append(
-                {
-                    "id": it.get("id"),
-                    "categoria_fiscal_ia": cat,
-                    "confianca_ia": float(conf),
-                    "motivo_ia": f"Resposta IA inválida (parser). Heurística: {why}",
-                    "origem": "fallback_parser",
-                }
+                {"id": it.get("id"), "categoria_fiscal_ia": cat, "confianca_ia": float(conf), "motivo_ia": f"Resposta IA inválida. Heurística: {why}", "origem": "fallback_parser"}
             )
         return out
 
@@ -605,37 +667,142 @@ def ai_classify_batch(items: List[Dict[str, Any]], model: str) -> List[Dict[str,
         if not r:
             cat, conf, why = heuristic_category(it.get("desc", ""))
             out.append(
-                {
-                    "id": it.get("id"),
-                    "categoria_fiscal_ia": cat,
-                    "confianca_ia": float(conf),
-                    "motivo_ia": f"IA sem item correspondente. Heurística: {why}",
-                    "origem": "fallback_sem_item",
-                }
+                {"id": it.get("id"), "categoria_fiscal_ia": cat, "confianca_ia": float(conf), "motivo_ia": f"IA sem item correspondente. Heurística: {why}", "origem": "fallback_sem_item"}
             )
             continue
-
         cat = (r.get("categoria_fiscal_ia") or "SVA_OUTROS").strip()
         if cat not in AI_ALLOWED:
             cat = "SVA_OUTROS"
-
         try:
             conf = float(r.get("confianca_ia", 0.6) or 0.6)
         except Exception:
             conf = 0.6
         conf = max(0.0, min(1.0, conf))
         motivo = (r.get("motivo_ia") or "").strip()[:220]
+        out.append({"id": it.get("id"), "categoria_fiscal_ia": cat, "confianca_ia": conf, "motivo_ia": motivo, "origem": "openai"})
+    return out
 
-        out.append(
+
+def ai_classify_consolidated(df_consol: pd.DataFrame, model: str) -> pd.DataFrame:
+    """
+    Consolidated-level IA:
+    Usa descrição + lista cClass + lista CFOP + ocorrências + total.
+    Retorna dataframe com colunas:
+      - ia_sugestao
+      - ia_confianca
+      - ia_motivo
+    """
+    df = df_consol.copy()
+    if df.empty:
+        df["ia_sugestao"] = ""
+        df["ia_confianca"] = 0.0
+        df["ia_motivo"] = ""
+        return df
+
+    client = get_openai_client()
+    if client is None:
+        # fallback: heurística usando só descrição; confiança moderada
+        sug = []
+        for _, r in df.iterrows():
+            cat, conf, why = heuristic_category(r.get("descricao_exemplo", ""))
+            sug.append((cat, float(conf), f"Sem OpenAI. Heurística: {why} (cClass/CFOP disponíveis, mas IA desativada)"))
+        df["ia_sugestao"] = [x[0] for x in sug]
+        df["ia_confianca"] = [x[1] for x in sug]
+        df["ia_motivo"] = [x[2] for x in sug]
+        return df
+
+    # prepara batch
+    items = []
+    for i, r in df.iterrows():
+        items.append(
             {
-                "id": it.get("id"),
-                "categoria_fiscal_ia": cat,
-                "confianca_ia": conf,
-                "motivo_ia": motivo,
-                "origem": "openai",
+                "id": str(r.get("desc_norm", ""))[:120] or f"row_{i}",
+                "descricao_exemplo": str(r.get("descricao_exemplo", ""))[:240],
+                "cClass_distintos": str(r.get("cClass_distintos", ""))[:180],
+                "CFOP_distintos": str(r.get("CFOP_distintos", ""))[:180],
+                "qtd_ocorrencias": int(r.get("qtd_ocorrencias", 0) or 0),
+                "total_vServ": float(r.get("total_vServ", 0.0) or 0.0),
+                "categoria_atual": str(r.get("categoria_sugerida", "")),
             }
         )
-    return out
+
+    # chama em chunks
+    out_rows = []
+    for start in range(0, len(items), 40):
+        chunk = items[start : start + 40]
+
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": AI_SYSTEM_CONSOL},
+                {
+                    "role": "user",
+                    "content": (
+                        "Retorne SOMENTE JSON válido no formato:\n"
+                        "{\"items\":[{\"id\":\"...\",\"ia_sugestao\":\"SCM|SVA_EBOOK|SVA_LOCACAO|SVA_TV_STREAMING|SVA_OUTROS\","
+                        "\"ia_confianca\":0.0-1.0,\"ia_motivo\":\"...\"}]}\n\n"
+                        + json.dumps({"items": chunk}, ensure_ascii=False)
+                    ),
+                },
+            ],
+            temperature=0.0,
+            max_output_tokens=2000,
+        )
+
+        data = _safe_json_loads((resp.output_text or "").strip())
+        if not data or "items" not in data:
+            # fallback chunk
+            for it in chunk:
+                cat, conf, why = heuristic_category(it.get("descricao_exemplo", ""))
+                out_rows.append(
+                    {
+                        "id": it["id"],
+                        "ia_sugestao": cat,
+                        "ia_confianca": float(conf),
+                        "ia_motivo": f"Resposta IA inválida. Heurística: {why}",
+                    }
+                )
+            continue
+
+        got = data.get("items", [])
+        by_id = {r.get("id"): r for r in got if isinstance(r, dict)}
+        for it in chunk:
+            r = by_id.get(it["id"])
+            if not r:
+                cat, conf, why = heuristic_category(it.get("descricao_exemplo", ""))
+                out_rows.append(
+                    {"id": it["id"], "ia_sugestao": cat, "ia_confianca": float(conf), "ia_motivo": f"IA sem item. Heurística: {why}"}
+                )
+                continue
+            sug = (r.get("ia_sugestao") or "SVA_OUTROS").strip()
+            if sug not in AI_ALLOWED:
+                sug = "SVA_OUTROS"
+            try:
+                conf = float(r.get("ia_confianca", 0.6) or 0.6)
+            except Exception:
+                conf = 0.6
+            conf = max(0.0, min(1.0, conf))
+            motivo = (r.get("ia_motivo") or "").strip()[:260]
+            out_rows.append({"id": it["id"], "ia_sugestao": sug, "ia_confianca": conf, "ia_motivo": motivo})
+
+    out_df = pd.DataFrame(out_rows)
+    if out_df.empty:
+        df["ia_sugestao"] = ""
+        df["ia_confianca"] = 0.0
+        df["ia_motivo"] = ""
+        return df
+
+    # merge by id (id = desc_norm)
+    df["_id_join"] = df["desc_norm"].astype(str).str.slice(0, 120)
+    out_df["_id_join"] = out_df["id"].astype(str).str.slice(0, 120)
+
+    df = df.merge(out_df[["_id_join", "ia_sugestao", "ia_confianca", "ia_motivo"]], on="_id_join", how="left")
+    df.drop(columns=["_id_join"], inplace=True)
+
+    df["ia_sugestao"] = df["ia_sugestao"].fillna("")
+    df["ia_confianca"] = df["ia_confianca"].fillna(0.0)
+    df["ia_motivo"] = df["ia_motivo"].fillna("")
+    return df
 
 
 # =========================================================
@@ -694,7 +861,6 @@ def simulate_and_or_correct_xml_nfcom(
     ns = get_ns(new_tree)
 
     decisions = {int(r["item"]): (str(r["categoria_fiscal_ia"]), float(r["confianca_ia"])) for _, r in df_dec.iterrows()}
-
     dets = xp(copy_root, ns, ".//n:det | .//det")
     changes: List[Dict[str, Any]] = []
 
@@ -707,11 +873,7 @@ def simulate_and_or_correct_xml_nfcom(
             if cfop_nodes:
                 old_cfop = (cfop_nodes[0].text or "").strip()
                 changes.append(
-                    {
-                        "item": idx,
-                        "acao": "REMOVER_CFOP_SVA",
-                        "detalhe": f"Remover CFOP='{old_cfop}' (cat={cat}, conf={conf:.2f})",
-                    }
+                    {"item": idx, "acao": "REMOVER_CFOP_SVA", "detalhe": f"Remover CFOP='{old_cfop}' (cat={cat}, conf={conf:.2f})"}
                 )
                 if apply_changes:
                     for node in cfop_nodes:
@@ -729,13 +891,7 @@ def simulate_and_or_correct_xml_nfcom(
                 vi = to_float(vi_text)
                 vp = to_float(vp_text)
                 if vp < vi:
-                    changes.append(
-                        {
-                            "item": idx,
-                            "acao": "AJUSTAR_VPROD",
-                            "detalhe": f"vProd {vp_text} -> {vi_text} (paliativo desconto)",
-                        }
-                    )
+                    changes.append({"item": idx, "acao": "AJUSTAR_VPROD", "detalhe": f"vProd {vp_text} -> {vi_text} (paliativo desconto)"})
                     if apply_changes:
                         vprod_nodes[0].text = vi_text
 
@@ -768,6 +924,7 @@ def generate_excel_report(**dfs) -> bytes:
 def main():
     training_init()
 
+    # Header
     c1, c2 = st.columns([1, 4])
     with c1:
         try:
@@ -778,6 +935,7 @@ def main():
         st.markdown(f"## {APP_TITLE}")
         st.caption("Desenvolvido por Raul Martins — Contare Contabilidade especializada em Provedores de Internet")
 
+    # Sidebar configs
     st.sidebar.header("Configurações")
 
     apply_changes = st.sidebar.radio(
@@ -802,16 +960,23 @@ def main():
         "Limiar para sugestão forte (sem IA)", 0.50, 1.00, 0.85, 0.01, key="sld_suggest_threshold"
     )
 
+    # Consolidated IA
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("IA na consolidação")
+    ia_consol_min_conf = st.sidebar.slider(
+        "Confiança mínima para assumir sugestão da IA no consolidado",
+        0.50, 1.00, 0.90, 0.01,
+        key="sld_ia_consol_conf"
+    )
+    st.sidebar.caption("A sugestão da IA não aplica automaticamente: serve para facilitar a validação manual.")
+
+    # Training base
     st.sidebar.markdown("---")
     st.sidebar.subheader("Base de aprendizado (SCM/SVA)")
-
     up_train = st.sidebar.file_uploader("Importar base (CSV ou XLSX)", type=["csv", "xlsx"], key="up_train")
     if up_train is not None:
         ok, msg = training_merge_uploaded(up_train)
-        if ok:
-            st.sidebar.success(msg)
-        else:
-            st.sidebar.error(msg)
+        (st.sidebar.success(msg) if ok else st.sidebar.error(msg))
 
     df_train = training_load()
     st.sidebar.download_button(
@@ -821,6 +986,7 @@ def main():
         key="dl_training_csv",
     )
 
+    # Cancel list
     st.sidebar.markdown("---")
     cancel_file = st.sidebar.file_uploader("Chaves canceladas (CSV/TXT)", type=["csv", "txt"], key="up_cancel")
     cancel_keys = set()
@@ -832,6 +998,7 @@ def main():
             text = raw.decode("latin1", errors="ignore")
         cancel_keys = set(re.findall(r"\d{44}", text))
 
+    # Upload XML/ZIP
     uploaded = st.file_uploader(
         "Envie XML (NFCom) ou ZIP com XMLs",
         type=["xml", "zip"],
@@ -857,11 +1024,13 @@ def main():
         def handle_xml(xml_bytes: bytes, base_name: str, logical_name: str):
             nonlocal client_cnpj, client_nome, month_ref
 
+            # Detect event cancel XML
             is_evt, chave_evt, tipo_evt = detect_cancelamento_event_bytes(xml_bytes)
             if is_evt:
                 canceled.append({"arquivo_base": base_name, "chave": chave_evt, "status": f"evento_cancelamento_{tipo_evt}"})
                 return
 
+            # Detect cancel words inside xml
             is_prot, chave_prot, tipo_prot = detect_canceled_by_protocol_bytes(xml_bytes)
             if is_prot:
                 canceled.append({"arquivo_base": base_name, "chave": chave_prot, "status": f"cancelado_protocolo_{tipo_prot}"})
@@ -912,16 +1081,23 @@ def main():
             st.session_state["processed"] = True
             st.rerun()
 
+        # normalize + ids
         df_items["desc_norm"] = df_items["descricao"].fillna("").map(normalize_text)
         df_items["id_desc"] = df_items["desc_norm"].map(lambda x: re.sub(r"[^a-z0-9]+", "_", x)[:80])
 
+        # flag 1100101 (para alertas e excel)
+        df_items["flag_cclass_1100101"] = df_items["cClass"].astype(str).str.strip().eq(ALERTA_CCLASS)
+
+        # training match
         train_map = training_lookup_map(df_train, client_cnpj or "")
         df_items["categoria_training"] = df_items["desc_norm"].map(lambda dn: train_map.get(dn, ""))
         df_items["confianca_training"] = df_items["categoria_training"].map(lambda c: 1.0 if c in AI_ALLOWED else 0.0)
 
+        # heuristic
         heur = df_items["descricao"].fillna("").map(lambda d: heuristic_category(d))
         df_items["categoria_heur"], df_items["confianca_heur"], df_items["motivo_heur"] = zip(*heur)
 
+        # need AI (item-level)
         need_ai_mask = (
             enable_ai
             & (df_items["confianca_training"].astype(float) < 0.99)
@@ -934,9 +1110,10 @@ def main():
             batch = [{"id": r["id_desc"], "desc": r["descricao"], "cClass": r.get("cClass", ""), "cfop": r.get("CFOP", "")} for _, r in df_need.iterrows()]
             for i in range(0, len(batch), 50):
                 chunk = batch[i : i + 50]
-                for r in ai_classify_batch(chunk, model=ai_model):
+                for r in ai_classify_batch_items(chunk, model=ai_model):
                     ai_by_id[r["id"]] = r
 
+        # final decision per item
         def decide_row(r):
             if r.get("categoria_training", "") in AI_ALLOWED:
                 cat = r["categoria_training"]
@@ -949,6 +1126,7 @@ def main():
                 motivo = r["motivo_heur"]
                 origem = "heuristica"
                 ai = ai_by_id.get(r["id_desc"])
+                # usa IA quando heurística não for muito alta
                 if ai is not None and conf < 0.95:
                     cat = ai.get("categoria_fiscal_ia", cat)
                     conf = float(ai.get("confianca_ia", conf))
@@ -960,13 +1138,13 @@ def main():
 
         df_items[["categoria_fiscal_ia", "confianca_ia", "motivo_ia", "origem_ia"]] = df_items.apply(decide_row, axis=1)
 
-        # Fila de revisão (será exibida consolidada)
+        # fila de revisão (baixa confiança)
         df_revisar = df_items.loc[
             (df_items["origem_ia"] != "aprendizado") & (df_items["confianca_ia"].astype(float) < corr_auto_threshold),
             ["arquivo", "item", "descricao", "cClass", "CFOP", "categoria_fiscal_ia", "confianca_ia", "motivo_ia", "origem_ia", "vServ", "desc_norm"],
         ].copy()
 
-        # Pré-gerar logs e XMLs para preview e downloads
+        # gera XMLs para preview/download (baseado no que está classificado no momento)
         per_file = []
         changes_all = []
         for x in xml_ativos:
@@ -1018,6 +1196,13 @@ def main():
             else pd.DataFrame(columns=["arquivo", "base_name", "chave", "item", "acao", "detalhe", "modo"])
         )
 
+        # Alertas (aba excel)
+        df_alertas = pd.DataFrame()
+        if "flag_cclass_1100101" in df_items.columns and df_items["flag_cclass_1100101"].any():
+            df_alertas = df_items[df_items["flag_cclass_1100101"]].copy()
+            cols = [c for c in ["arquivo", "item", "descricao", "cClass", "CFOP", "vServ", "vItem", "vProd", "vDesc", "vOutros"] if c in df_alertas.columns]
+            df_alertas = df_alertas[cols]
+
         st.session_state["results"] = {
             "empty": False,
             "client_cnpj": client_cnpj,
@@ -1027,9 +1212,11 @@ def main():
             "df_revisar": df_revisar,
             "df_files": df_files,
             "df_changes": df_changes,
+            "df_alertas": df_alertas,
             "invalid": invalid,
             "canceled": canceled,
             "apply_changes": apply_changes,
+            "ia_consol_last": None,  # cache da sugestão IA do consolidado
         }
         st.session_state["processed"] = True
         st.rerun()
@@ -1056,126 +1243,34 @@ def main():
     df_revisar = res["df_revisar"]
     df_files = res["df_files"]
     df_changes = res["df_changes"]
+    df_alertas = res.get("df_alertas", pd.DataFrame())
     client_cnpj = res.get("client_cnpj", "")
     client_nome = res.get("client_nome", "")
     month_ref = res.get("month_ref", "")
     apply_changes = bool(res.get("apply_changes", True))
 
-    # =========================================================
-    # ✅ FILA DE REVISÃO CONSOLIDADA
-    # =========================================================
-    st.subheader("Fila de revisão (consolidada por item) — aprove e o sistema aprende")
-
-    if df_revisar.empty:
-        st.success("Nenhum item precisa de revisão neste lote.")
-    else:
-        df_rev = df_revisar.copy()
-
-        def _join_unique(series, max_items=6):
-            vals = [str(v).strip() for v in series.dropna().unique().tolist() if str(v).strip()]
-            if not vals:
-                return ""
-            vals = vals[:max_items]
-            return " | ".join(vals)
-
-        df_consol = (
-            df_rev.groupby("desc_norm", as_index=False)
-            .agg(
-                descricao_exemplo=("descricao", "first"),
-                categoria_sugerida=("categoria_fiscal_ia", "first"),
-                confianca_min=("confianca_ia", "min"),
-                confianca_media=("confianca_ia", "mean"),
-                qtd_ocorrencias=("desc_norm", "size"),
-                total_vServ=("vServ", "sum"),
-                cClass_distintos=("cClass", _join_unique),
-                CFOP_distintos=("CFOP", _join_unique),
+    # ✅ Alerta 1100101 no SIDEBAR
+    if "flag_cclass_1100101" in df_items.columns and df_items["flag_cclass_1100101"].any():
+        st.sidebar.warning(ALERTA_TEXTO)
+        with st.sidebar.expander("Ver itens cClass 1100101"):
+            st.sidebar.dataframe(
+                df_items[df_items["flag_cclass_1100101"]][["arquivo", "item", "descricao", "cClass", "CFOP", "vServ"]]
+                if all(c in df_items.columns for c in ["arquivo", "item", "descricao", "cClass", "CFOP", "vServ"])
+                else df_items[df_items["flag_cclass_1100101"]],
+                use_container_width=True,
+                height=220,
             )
-        )
-        df_consol["categoria_aprovada"] = df_consol["categoria_sugerida"]
 
-        st.caption(
-            "A tabela abaixo consolida itens repetidos (mesma descrição normalizada). "
-            "Ao aprovar uma categoria, ela será aplicada a TODAS as ocorrências iguais no lote."
-        )
-
-        edited = st.data_editor(
-            df_consol[
-                [
-                    "descricao_exemplo",
-                    "categoria_sugerida",
-                    "categoria_aprovada",
-                    "confianca_min",
-                    "qtd_ocorrencias",
-                    "total_vServ",
-                    "cClass_distintos",
-                    "CFOP_distintos",
-                ]
-            ],
-            use_container_width=True,
-            num_rows="dynamic",
-            column_config={
-                "categoria_aprovada": st.column_config.SelectboxColumn(
-                    "categoria_aprovada", options=CATEGORIES, required=True
-                )
-            },
-            key="editor_revisao_consolidada",
-        )
-
-        if st.button("Salvar aprovações (aplica em massa no lote + aprende)", key="btn_salvar_aprovacoes"):
-            df_consol_edit = df_consol.copy()
-            df_consol_edit["categoria_aprovada"] = edited["categoria_aprovada"].values
-
-            map_aprov = dict(zip(df_consol_edit["desc_norm"], df_consol_edit["categoria_aprovada"]))
-
-            # aplica em massa no df_items
-            df_items_local = st.session_state["results"]["df_items"].copy()
-            mask = df_items_local["desc_norm"].isin(map_aprov.keys())
-
-            df_items_local.loc[mask, "categoria_fiscal_ia"] = df_items_local.loc[mask, "desc_norm"].map(map_aprov)
-            df_items_local.loc[mask, "confianca_ia"] = 1.0
-            df_items_local.loc[mask, "motivo_ia"] = "Aprovado manualmente (consolidado)"
-            df_items_local.loc[mask, "origem_ia"] = "aprendizado"
-
-            # salva aprendizado (1 por desc_norm)
-            now = datetime.now().isoformat(timespec="seconds")
-            rows = []
-            for dn, cat in map_aprov.items():
-                if cat in AI_ALLOWED and dn:
-                    exemplo = (
-                        df_items_local.loc[df_items_local["desc_norm"] == dn, "descricao"]
-                        .astype(str)
-                        .head(1)
-                        .tolist()
-                    )
-                    rows.append(
-                        {
-                            "emit_cnpj": st.session_state["results"].get("client_cnpj", "") or "",
-                            "desc_norm": dn,
-                            "descricao_exemplo": (exemplo[0] if exemplo else "")[:250],
-                            "categoria_aprovada": cat,
-                            "created_at": now,
-                            "source": "aprovacao_consolidada",
-                        }
-                    )
-            if rows:
-                training_append(rows)
-
-            # atualiza estado
-            st.session_state["results"]["df_items"] = df_items_local
-
-            # recalcula fila de revisão
-            df_revisar_now = df_items_local.loc[
-                (df_items_local["origem_ia"] != "aprendizado")
-                & (df_items_local["confianca_ia"].astype(float) < float(st.session_state.get("sld_cfop_threshold", 0.95))),
-                ["arquivo", "item", "descricao", "cClass", "CFOP", "categoria_fiscal_ia", "confianca_ia", "motivo_ia", "origem_ia", "vServ", "desc_norm"],
-            ].copy()
-            st.session_state["results"]["df_revisar"] = df_revisar_now
-
-            st.success(
-                f"Aprovações aplicadas em massa e salvas na base. "
-                f"Itens únicos aprovados: {len(map_aprov)} | Ocorrências impactadas: {int(mask.sum())}"
+    # ✅ Alerta 1100101 no TOPO
+    if "flag_cclass_1100101" in df_items.columns and df_items["flag_cclass_1100101"].any():
+        st.warning(ALERTA_TEXTO, icon="⚠️")
+        with st.expander("Ver itens com cClass 1100101"):
+            st.dataframe(
+                df_items[df_items["flag_cclass_1100101"]][["arquivo", "item", "descricao", "cClass", "CFOP", "vServ"]]
+                if all(c in df_items.columns for c in ["arquivo", "item", "descricao", "cClass", "CFOP", "vServ"])
+                else df_items[df_items["flag_cclass_1100101"]],
+                use_container_width=True,
             )
-            st.rerun()
 
     # =========================================================
     # Dashboard do lote
@@ -1194,6 +1289,187 @@ def main():
     df_cat = df_items.groupby("categoria_fiscal_ia").agg(qtd_itens=("arquivo", "count"), total_vServ=("vServ", "sum")).reset_index()
     st.dataframe(df_cat, use_container_width=True)
     st.bar_chart(df_cat.set_index("categoria_fiscal_ia")["total_vServ"])
+
+    # =========================================================
+    # Consolidação + IA (considera cClass e CFOP)
+    # =========================================================
+    st.subheader("Classificação consolidada por item (com IA considerando cClass + descrição)")
+
+    modo_consol = st.radio(
+        "Consolidar a partir de:",
+        ["Somente itens a revisar (baixa confiança)", "Todos os itens do lote (recomendado p/ conferência)"],
+        index=1,
+        horizontal=True,
+        key="modo_consolidacao",
+    )
+
+    if modo_consol.startswith("Somente"):
+        df_base = df_revisar.copy()
+    else:
+        df_base = df_items.copy()
+
+    if df_base.empty:
+        st.info("Não há itens para consolidar com o filtro atual.")
+    else:
+        for c in ["desc_norm", "descricao", "categoria_fiscal_ia", "confianca_ia", "cClass", "CFOP", "vServ"]:
+            if c not in df_base.columns:
+                df_base[c] = ""
+
+        def _join_unique(series, max_items=10):
+            vals = [str(v).strip() for v in series.dropna().unique().tolist() if str(v).strip()]
+            if not vals:
+                return ""
+            vals = vals[:max_items]
+            return " | ".join(vals)
+
+        df_consol = (
+            df_base.groupby("desc_norm", as_index=False)
+            .agg(
+                descricao_exemplo=("descricao", "first"),
+                categoria_sugerida=("categoria_fiscal_ia", "first"),
+                confianca_min=("confianca_ia", "min"),
+                confianca_media=("confianca_ia", "mean"),
+                qtd_ocorrencias=("desc_norm", "size"),
+                total_vServ=("vServ", "sum"),
+                cClass_distintos=("cClass", _join_unique),
+                CFOP_distintos=("CFOP", _join_unique),
+            )
+        )
+
+        # filtros úteis
+        colf1, colf2, colf3 = st.columns([1, 1, 2])
+        with colf1:
+            filtro_cat = st.multiselect("Filtrar categoria", options=CATEGORIES, default=[], key="flt_cat")
+        with colf2:
+            min_conf = st.slider("Confiança mínima (min)", 0.0, 1.0, 0.0, 0.01, key="flt_conf")
+        with colf3:
+            busca = st.text_input("Buscar na descrição", value="", key="flt_busca")
+
+        df_show = df_consol.copy()
+        if filtro_cat:
+            df_show = df_show[df_show["categoria_sugerida"].isin(filtro_cat)]
+        df_show = df_show[df_show["confianca_min"].astype(float) >= float(min_conf)]
+        if busca.strip():
+            b = normalize_text(busca.strip())
+            df_show = df_show[df_show["descricao_exemplo"].astype(str).map(normalize_text).str.contains(b, na=False)]
+
+        # IA no consolidado (botão)
+        st.caption("Dica: clique em **Rodar IA no consolidado** para refinar sugestões usando descrição + cClass + CFOP + volume.")
+        colbtn1, colbtn2 = st.columns([1, 3])
+        with colbtn1:
+            run_ai_consol = st.button("Rodar IA no consolidado", key="btn_ai_consol")
+        with colbtn2:
+            st.write("")
+
+        if run_ai_consol:
+            # roda IA em cima do df_show, mas mantendo desc_norm
+            with st.spinner("Classificando consolidado com IA (considerando cClass + CFOP)..."):
+                df_ai = ai_classify_consolidated(df_show, model=ai_model)
+            st.session_state["results"]["ia_consol_last"] = df_ai
+
+        df_ai_last = st.session_state["results"].get("ia_consol_last")
+        if isinstance(df_ai_last, pd.DataFrame) and not df_ai_last.empty:
+            # alinhar pelo desc_norm
+            df_ai_last = df_ai_last[["desc_norm", "ia_sugestao", "ia_confianca", "ia_motivo"]].copy()
+            df_show = df_show.merge(df_ai_last, on="desc_norm", how="left")
+        else:
+            df_show["ia_sugestao"] = ""
+            df_show["ia_confianca"] = 0.0
+            df_show["ia_motivo"] = ""
+
+        # categoria_aprovada default:
+        # se IA tiver confiança alta >= slider, pré-preenche com sugestão IA; senão usa categoria_sugerida
+        def _default_aprov(row):
+            try:
+                conf = float(row.get("ia_confianca", 0.0) or 0.0)
+            except Exception:
+                conf = 0.0
+            sug = (row.get("ia_sugestao", "") or "").strip()
+            if sug in AI_ALLOWED and conf >= float(ia_consol_min_conf):
+                return sug
+            return row.get("categoria_sugerida", "SVA_OUTROS")
+
+        df_show["categoria_aprovada"] = df_show.apply(_default_aprov, axis=1)
+
+        st.caption(
+            "A lista abaixo está consolidada por descrição (normalizada). "
+            "Ao aprovar uma categoria, o app aplica para TODAS as ocorrências iguais no lote e salva no aprendizado."
+        )
+
+        edited = st.data_editor(
+            df_show[
+                [
+                    "descricao_exemplo",
+                    "cClass_distintos",
+                    "CFOP_distintos",
+                    "qtd_ocorrencias",
+                    "total_vServ",
+                    "categoria_sugerida",
+                    "ia_sugestao",
+                    "ia_confianca",
+                    "categoria_aprovada",
+                ]
+            ],
+            use_container_width=True,
+            num_rows="dynamic",
+            column_config={
+                "categoria_aprovada": st.column_config.SelectboxColumn("categoria_aprovada", options=CATEGORIES, required=True),
+            },
+            key="editor_consolidado",
+        )
+
+        st.download_button(
+            "Baixar consolidação (CSV)",
+            data=df_show.to_csv(index=False).encode("utf-8"),
+            file_name="consolidado_itens.csv",
+            key="dl_consolidado_csv",
+        )
+
+        if st.button("Aplicar aprovações do consolidado (em massa + aprende)", key="btn_apply_consol"):
+            # mapear por desc_norm (precisa manter o desc_norm alinhado)
+            df_apply = df_show[["desc_norm"]].copy()
+            df_apply["categoria_aprovada"] = edited["categoria_aprovada"].values
+            map_aprov = dict(zip(df_apply["desc_norm"], df_apply["categoria_aprovada"]))
+
+            df_items_local = st.session_state["results"]["df_items"].copy()
+            mask = df_items_local["desc_norm"].isin(map_aprov.keys())
+
+            df_items_local.loc[mask, "categoria_fiscal_ia"] = df_items_local.loc[mask, "desc_norm"].map(map_aprov)
+            df_items_local.loc[mask, "confianca_ia"] = 1.0
+            df_items_local.loc[mask, "motivo_ia"] = "Aprovado manualmente (consolidado)"
+            df_items_local.loc[mask, "origem_ia"] = "aprendizado"
+
+            # salva base (1 por desc_norm)
+            now = datetime.now().isoformat(timespec="seconds")
+            rows = []
+            for dn, cat in map_aprov.items():
+                if cat in AI_ALLOWED and dn:
+                    exemplo = df_items_local.loc[df_items_local["desc_norm"] == dn, "descricao"].astype(str).head(1).tolist()
+                    rows.append(
+                        {
+                            "emit_cnpj": st.session_state["results"].get("client_cnpj", "") or "",
+                            "desc_norm": dn,
+                            "descricao_exemplo": (exemplo[0] if exemplo else "")[:250],
+                            "categoria_aprovada": cat,
+                            "created_at": now,
+                            "source": "aprovacao_consolidada",
+                        }
+                    )
+            if rows:
+                training_append(rows)
+
+            # atualiza df_items no estado
+            st.session_state["results"]["df_items"] = df_items_local
+
+            # recalcula df_revisar
+            df_revisar_now = df_items_local.loc[
+                (df_items_local["origem_ia"] != "aprendizado") & (df_items_local["confianca_ia"].astype(float) < corr_auto_threshold),
+                ["arquivo", "item", "descricao", "cClass", "CFOP", "categoria_fiscal_ia", "confianca_ia", "motivo_ia", "origem_ia", "vServ", "desc_norm"],
+            ].copy()
+            st.session_state["results"]["df_revisar"] = df_revisar_now
+
+            st.success(f"Aprovações aplicadas. Itens únicos aprovados: {len(map_aprov)} | Ocorrências impactadas: {int(mask.sum())}")
+            st.rerun()
 
     # =========================================================
     # Log de mudanças por XML
@@ -1237,7 +1513,7 @@ def main():
             st.text_area("saida", value=(row["xml_saida"].decode("utf-8", errors="ignore")), height=420)
 
     # =========================================================
-    # Downloads
+    # Downloads (ZIPs)
     # =========================================================
     st.subheader("Downloads")
 
@@ -1269,43 +1545,33 @@ def main():
 
     d1, d2, d3 = st.columns(3)
     with d1:
-        st.download_button(
-            "Baixar ZIP – Todos ativos",
-            data=build_zip("todos"),
-            file_name="xml_ativos.zip",
-            mime="application/zip",
-            key="dl_zip_todos",
-        )
+        st.download_button("Baixar ZIP – Todos ativos", data=build_zip("todos"), file_name="xml_ativos.zip", mime="application/zip", key="dl_zip_todos")
     with d2:
-        st.download_button(
-            "Baixar ZIP – Somente com mudança",
-            data=build_zip("somente_corrigidos"),
-            file_name="xml_somente_mudanca.zip",
-            mime="application/zip",
-            key="dl_zip_mudanca",
-        )
+        st.download_button("Baixar ZIP – Somente com mudança", data=build_zip("somente_corrigidos"), file_name="xml_somente_mudanca.zip", mime="application/zip", key="dl_zip_mudanca")
     with d3:
-        st.download_button(
-            "Baixar ZIP – Somente sem mudança",
-            data=build_zip("somente_sem_mudanca"),
-            file_name="xml_sem_mudanca.zip",
-            mime="application/zip",
-            key="dl_zip_sem_mudanca",
-        )
+        st.download_button("Baixar ZIP – Somente sem mudança", data=build_zip("somente_sem_mudanca"), file_name="xml_sem_mudanca.zip", mime="application/zip", key="dl_zip_sem_mudanca")
 
     # =========================================================
     # Relatório Excel
     # =========================================================
     st.markdown("---")
     st.subheader("Relatório (Excel)")
+
+    # alerta tab
+    df_alertas_local = df_alertas if isinstance(df_alertas, pd.DataFrame) else pd.DataFrame()
+
     try:
         excel = generate_excel_report(
-            Resumo=pd.DataFrame([{"cliente_cnpj": client_cnpj, "cliente_nome": client_nome, "competencia": month_ref, "modo": "APLICADO" if apply_changes else "SUGERIDO"}]),
+            Resumo=pd.DataFrame(
+                [
+                    {"cliente_cnpj": client_cnpj, "cliente_nome": client_nome, "competencia": month_ref, "modo": "APLICADO" if apply_changes else "SUGERIDO"}
+                ]
+            ),
             Detalhamento_Itens=df_items.drop(columns=["desc_norm", "id_desc"], errors="ignore"),
             Resumo_Categoria=df_cat,
+            Alertas=df_alertas_local if not df_alertas_local.empty else None,
             Arquivos_Status=df_files[["arquivo", "base_name", "chave", "changed", "changes_count"]],
             Log_Mudancas=df_changes,
-            Itens_Revisao=df_revisar.drop(columns=["desc_norm"], errors="ignore"),
             Base_Aprendizado=training_load(),
         )
         st.download_button(
