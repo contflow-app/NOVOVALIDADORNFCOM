@@ -16,6 +16,7 @@ try:
 except Exception:
     OpenAI = None
 
+
 APP_TITLE = "Validador NFCom 62 + IA (SCM/SVA) – Contare (Aprendizado)"
 LOGO_PATH = "Logo-Contare-ISP-1.png"
 TRAINING_CSV = os.path.join("data", "training_data.csv")
@@ -24,6 +25,7 @@ CATEGORIES = ["SCM", "SVA_EBOOK", "SVA_LOCACAO", "SVA_TV_STREAMING", "SVA_OUTROS
 AI_ALLOWED = set(CATEGORIES)
 
 st.set_page_config(page_title=APP_TITLE, layout="wide")
+
 
 # ===============================
 # Session State (persistência)
@@ -37,22 +39,30 @@ if "processed" not in st.session_state:
 # =========================================================
 # Utilities
 # =========================================================
-
 def normalize_text(s: str) -> str:
     if not s:
         return ""
     s = str(s).lower()
-    trans = str.maketrans({
-        "á": "a", "à": "a", "ã": "a", "â": "a",
-        "é": "e", "ê": "e",
-        "í": "i",
-        "ó": "o", "õ": "o", "ô": "o",
-        "ú": "u",
-        "ç": "c",
-    })
+    trans = str.maketrans(
+        {
+            "á": "a",
+            "à": "a",
+            "ã": "a",
+            "â": "a",
+            "é": "e",
+            "ê": "e",
+            "í": "i",
+            "ó": "o",
+            "õ": "o",
+            "ô": "o",
+            "ú": "u",
+            "ç": "c",
+        }
+    )
     s = s.translate(trans)
     s = re.sub(r"\s+", " ", s).strip()
     return s
+
 
 def to_float(x) -> float:
     try:
@@ -61,6 +71,7 @@ def to_float(x) -> float:
         return float(str(x).replace(",", "."))
     except Exception:
         return 0.0
+
 
 def num_to_br(value) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -77,15 +88,16 @@ def num_to_br(value) -> str:
 # =========================================================
 # XML helpers
 # =========================================================
-
 def parse_xml(file_bytes: bytes) -> etree._ElementTree:
     parser = etree.XMLParser(remove_blank_text=True, recover=True)
     return etree.parse(io.BytesIO(file_bytes), parser)
+
 
 def get_ns(tree: etree._ElementTree) -> Dict[str, str]:
     root = tree.getroot()
     default_ns = root.nsmap.get(None)
     return {"n": default_ns} if default_ns else {}
+
 
 def xp(node, ns, expr: str):
     if ns:
@@ -94,6 +106,7 @@ def xp(node, ns, expr: str):
         except Exception:
             return node.xpath(expr)
     return node.xpath(expr)
+
 
 def first_text(node, ns, expr: str) -> str:
     nodes = xp(node, ns, expr)
@@ -104,13 +117,17 @@ def first_text(node, ns, expr: str) -> str:
         return (n.text or "").strip()
     return str(n).strip()
 
+
 def extract_chave_acesso(tree: etree._ElementTree) -> str:
     root = tree.getroot()
     ns = get_ns(tree)
     for path in [
-        ".//n:infNFCom/@Id", ".//infNFCom/@Id",
-        ".//n:infNFe/@Id", ".//infNFe/@Id",
-        ".//n:infCte/@Id", ".//infCte/@Id",
+        ".//n:infNFCom/@Id",
+        ".//infNFCom/@Id",
+        ".//n:infNFe/@Id",
+        ".//infNFe/@Id",
+        ".//n:infCte/@Id",
+        ".//infCte/@Id",
     ]:
         ids = xp(root, ns, path)
         if ids:
@@ -121,10 +138,12 @@ def extract_chave_acesso(tree: etree._ElementTree) -> str:
     m2 = re.search(r"\d{44}", xml_str)
     return m2.group(0) if m2 else ""
 
+
 def get_nf_model(tree: etree._ElementTree) -> str:
     root = tree.getroot()
     ns = get_ns(tree)
     return first_text(root, ns, ".//n:ide/n:mod | .//ide/mod").strip()
+
 
 def get_emitente(tree: etree._ElementTree) -> Tuple[str, str]:
     root = tree.getroot()
@@ -132,6 +151,7 @@ def get_emitente(tree: etree._ElementTree) -> Tuple[str, str]:
     cnpj = first_text(root, ns, ".//n:emit/n:CNPJ | .//emit/CNPJ").strip()
     xnome = first_text(root, ns, ".//n:emit/n:xNome | .//emit/xNome").strip()
     return cnpj, xnome
+
 
 def get_competencia_mes(tree: etree._ElementTree) -> str:
     root = tree.getroot()
@@ -152,12 +172,16 @@ def get_competencia_mes(tree: etree._ElementTree) -> str:
 # =========================================================
 # Cancelamento detection
 # =========================================================
-
 def contains_cancel_words(text: str) -> bool:
     t = normalize_text(text or "")
     return ("cancelamento" in t) or ("cancelad" in t)
 
+
 def detect_cancelamento_event_bytes(xml_bytes: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Detecta XML de evento de cancelamento:
+      tpEvento=110111 + xEvento/xMotivo contendo cancelamento
+    """
     try:
         tree = parse_xml(xml_bytes)
     except Exception:
@@ -178,12 +202,15 @@ def detect_cancelamento_event_bytes(xml_bytes: bytes) -> Tuple[bool, Optional[st
     if ch_nfcom:
         return (True, ch_nfcom, "NFCom")
 
-    # fallback
     xml_str = etree.tostring(root, encoding="unicode")
     m = re.search(r"\d{44}", xml_str)
     return (True, m.group(0) if m else None, "desconhecido")
 
+
 def detect_canceled_by_protocol_bytes(xml_bytes: bytes) -> Tuple[bool, Optional[str], Optional[str]]:
+    """
+    Fallback: procura palavras de cancelamento em xEvento/xMotivo dentro do XML
+    """
     try:
         tree = parse_xml(xml_bytes)
     except Exception:
@@ -207,14 +234,20 @@ def detect_canceled_by_protocol_bytes(xml_bytes: bytes) -> Tuple[bool, Optional[
 # =========================================================
 # Training data (aprendizado)
 # =========================================================
-
 def training_init():
     os.makedirs(os.path.dirname(TRAINING_CSV), exist_ok=True)
     if not os.path.exists(TRAINING_CSV):
-        pd.DataFrame(columns=[
-            "emit_cnpj", "desc_norm", "descricao_exemplo",
-            "categoria_aprovada", "created_at", "source"
-        ]).to_csv(TRAINING_CSV, index=False, encoding="utf-8")
+        pd.DataFrame(
+            columns=[
+                "emit_cnpj",
+                "desc_norm",
+                "descricao_exemplo",
+                "categoria_aprovada",
+                "created_at",
+                "source",
+            ]
+        ).to_csv(TRAINING_CSV, index=False, encoding="utf-8")
+
 
 @st.cache_data
 def training_load() -> pd.DataFrame:
@@ -222,12 +255,23 @@ def training_load() -> pd.DataFrame:
     try:
         return pd.read_csv(TRAINING_CSV, dtype=str).fillna("")
     except Exception:
-        return pd.DataFrame(columns=[
-            "emit_cnpj", "desc_norm", "descricao_exemplo",
-            "categoria_aprovada", "created_at", "source"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "emit_cnpj",
+                "desc_norm",
+                "descricao_exemplo",
+                "categoria_aprovada",
+                "created_at",
+                "source",
+            ]
+        )
+
 
 def training_lookup_map(df_train: pd.DataFrame, emit_cnpj: str) -> Dict[str, str]:
+    """
+    Retorna mapa desc_norm -> categoria_aprovada
+    Preferência: por CNPJ do emitente; se não achar, usa registros globais (emit_cnpj vazio).
+    """
     m: Dict[str, str] = {}
     if df_train.empty:
         return m
@@ -246,6 +290,7 @@ def training_lookup_map(df_train: pd.DataFrame, emit_cnpj: str) -> Dict[str, str
             m[dn] = cat
     return m
 
+
 def training_append(rows: List[Dict[str, Any]]):
     training_init()
     df = training_load()
@@ -253,10 +298,11 @@ def training_append(rows: List[Dict[str, Any]]):
     pd.concat([df, df2], ignore_index=True).to_csv(TRAINING_CSV, index=False, encoding="utf-8")
     training_load.clear()
 
+
 def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
     """
     Aceita:
-      - CSV no formato interno: emit_cnpj, desc_norm, categoria_aprovada, ...
+      - CSV interno: emit_cnpj, desc_norm, categoria_aprovada, ...
       - CSV/XLSX simples: CNPJ | descricao | CLASSIFICACAO VALIDADA
         (CLASSIFICACAO VALIDADA: SCM / SVA / SVA_EBOOK / SVA_LOCACAO / SVA_TV_STREAMING / SVA_OUTROS)
     """
@@ -265,7 +311,6 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
     name = (getattr(uploaded_file, "name", "") or "").lower()
     data = uploaded_file.read()
 
-    # 1) Lê arquivo
     try:
         if name.endswith(".xlsx"):
             df_in = pd.read_excel(io.BytesIO(data), dtype=str).fillna("")
@@ -274,7 +319,6 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Arquivo inválido (não consegui ler). Erro: {e}"
 
-    # 2) Normaliza nomes de colunas
     cols_raw = {c: normalize_text(str(c)).replace(" ", "_") for c in df_in.columns}
     df_in = df_in.rename(columns=cols_raw)
 
@@ -290,7 +334,6 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
 
     now = datetime.now().isoformat(timespec="seconds")
 
-    # 3) Converte para formato interno
     if is_internal:
         df_norm = df_in.copy()
         df_norm["emit_cnpj"] = df_norm["emit_cnpj"].astype(str).fillna("")
@@ -323,7 +366,6 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
         df_norm["created_at"] = now
         df_norm["source"] = "importado_xlsx_simples"
 
-    # 4) valida
     df_norm = df_norm.replace({None: ""}).fillna("")
     df_norm = df_norm[df_norm["desc_norm"].astype(str).str.len() > 0]
     df_norm = df_norm[df_norm["categoria_aprovada"].isin(AI_ALLOWED)]
@@ -331,7 +373,6 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
     if df_norm.empty:
         return False, "Após normalização, não sobrou nenhuma linha válida (desc_norm vazio ou categoria inválida)."
 
-    # 5) mescla
     df_current = training_load()
     out = pd.concat([df_current, df_norm], ignore_index=True)
     out = out.drop_duplicates(subset=["emit_cnpj", "desc_norm"], keep="last")
@@ -344,17 +385,49 @@ def training_merge_uploaded(uploaded_file) -> Tuple[bool, str]:
 # =========================================================
 # Heuristic classifier
 # =========================================================
-
 SCM_KEYWORDS = [
-    "fibra", "fibra optica", "fibra óptica", "banda larga", "internet", "link",
-    "link dedicado", "dedicado", "ftth", "plano", "velocidade", "scm", "dados",
-    "conexao", "conexão", "wifi", "wi-fi", "provedor", "acesso", "rede", "conectividade"
+    "fibra",
+    "fibra optica",
+    "fibra óptica",
+    "banda larga",
+    "internet",
+    "link",
+    "link dedicado",
+    "dedicado",
+    "ftth",
+    "plano",
+    "velocidade",
+    "scm",
+    "dados",
+    "conexao",
+    "conexão",
+    "wifi",
+    "wi-fi",
+    "provedor",
+    "acesso",
+    "rede",
+    "conectividade",
 ]
 SVA_EBOOK_KEYWORDS = ["ebook", "e-book", "livro digital", "biblioteca digital", "leitura", "plataforma de leitura"]
 SVA_LOCACAO_KEYWORDS = ["locacao", "locação", "comodato", "aluguel", "locar", "equipamento", "roteador", "onu", "cpe"]
 SVA_TV_KEYWORDS = ["tv", "iptv", "streaming", "conteudo", "conteúdo", "televisao", "televisão"]
-SVA_GENERIC_KEYWORDS = ["antivirus", "antivírus", "backup", "email", "e-mail", "ip fixo", "suporte premium",
-                        "voip", "telefonia", "sva", "cloud", "nuvem", "seguranca", "segurança"]
+SVA_GENERIC_KEYWORDS = [
+    "antivirus",
+    "antivírus",
+    "backup",
+    "email",
+    "e-mail",
+    "ip fixo",
+    "suporte premium",
+    "voip",
+    "telefonia",
+    "sva",
+    "cloud",
+    "nuvem",
+    "seguranca",
+    "segurança",
+]
+
 
 def heuristic_category(desc: str) -> Tuple[str, float, str]:
     d = normalize_text(desc)
@@ -378,7 +451,6 @@ def heuristic_category(desc: str) -> Tuple[str, float, str]:
 # =========================================================
 # OpenAI classifier (robust parsing)
 # =========================================================
-
 AI_SYSTEM = """Você é um classificador fiscal para itens de NFCom (Modelo 62).
 Classifique cada item em UMA categoria:
 - SCM
@@ -396,6 +468,7 @@ Regras:
 Retorne SOMENTE JSON válido.
 """
 
+
 def get_openai_client():
     key = st.secrets.get("OPENAI_API_KEY", None) if hasattr(st, "secrets") else None
     key = key or os.environ.get("OPENAI_API_KEY")
@@ -403,43 +476,51 @@ def get_openai_client():
         return None
     return OpenAI(api_key=key)
 
+
 def ai_classify_batch(items: List[Dict[str, Any]], model: str) -> List[Dict[str, Any]]:
     client = get_openai_client()
     if client is None:
         out = []
         for it in items:
             cat, conf, why = heuristic_category(it.get("desc", ""))
-            out.append({
-                "id": it.get("id"),
-                "categoria_fiscal_ia": cat,
-                "confianca_ia": float(conf),
-                "motivo_ia": f"Sem OpenAI. Heurística: {why}",
-                "origem": "heuristica",
-            })
+            out.append(
+                {
+                    "id": it.get("id"),
+                    "categoria_fiscal_ia": cat,
+                    "confianca_ia": float(conf),
+                    "motivo_ia": f"Sem OpenAI. Heurística: {why}",
+                    "origem": "heuristica",
+                }
+            )
         return out
 
-    payload = [{
-        "id": it.get("id"),
-        "descricao": (it.get("desc") or "")[:220],
-        "cClass": (it.get("cClass") or "")[:32],
-        "CFOP": (it.get("cfop") or "")[:16],
-    } for it in items]
-
+    payload = [
+        {
+            "id": it.get("id"),
+            "descricao": (it.get("desc") or "")[:220],
+            "cClass": (it.get("cClass") or "")[:32],
+            "CFOP": (it.get("cfop") or "")[:16],
+        }
+        for it in items
+    ]
     user_msg = {"items": payload}
 
     resp = client.responses.create(
         model=model,
         input=[
             {"role": "system", "content": AI_SYSTEM},
-            {"role": "user", "content": (
-                "Classifique os itens abaixo. Retorne SOMENTE JSON válido no formato:\n"
-                '{"items":[{"id":"...","categoria_fiscal_ia":"SCM|SVA_EBOOK|SVA_LOCACAO|SVA_TV_STREAMING|SVA_OUTROS",'
-                '"confianca_ia":0.0-1.0,"motivo_ia":"..."}]}\n\n'
-                + json.dumps(user_msg, ensure_ascii=False)
-            )}
+            {
+                "role": "user",
+                "content": (
+                    "Classifique os itens abaixo. Retorne SOMENTE JSON válido no formato:\n"
+                    '{"items":[{"id":"...","categoria_fiscal_ia":"SCM|SVA_EBOOK|SVA_LOCACAO|SVA_TV_STREAMING|SVA_OUTROS",'
+                    '"confianca_ia":0.0-1.0,"motivo_ia":"..."}]}\n\n'
+                    + json.dumps(user_msg, ensure_ascii=False)
+                ),
+            },
         ],
         temperature=0.0,
-        max_output_tokens=1400
+        max_output_tokens=1400,
     )
 
     raw_text = (resp.output_text or "").strip()
@@ -475,7 +556,7 @@ def ai_classify_batch(items: List[Dict[str, Any]], model: str) -> List[Dict[str,
                 elif ch == "}":
                     depth -= 1
                     if depth == 0:
-                        return t[start:i+1]
+                        return t[start : i + 1]
         return None
 
     def _safe_json_loads(t: str) -> Optional[dict]:
@@ -504,13 +585,15 @@ def ai_classify_batch(items: List[Dict[str, Any]], model: str) -> List[Dict[str,
         out = []
         for it in items:
             cat, conf, why = heuristic_category(it.get("desc", ""))
-            out.append({
-                "id": it.get("id"),
-                "categoria_fiscal_ia": cat,
-                "confianca_ia": float(conf),
-                "motivo_ia": f"Resposta IA inválida (parser). Heurística: {why}",
-                "origem": "fallback_parser",
-            })
+            out.append(
+                {
+                    "id": it.get("id"),
+                    "categoria_fiscal_ia": cat,
+                    "confianca_ia": float(conf),
+                    "motivo_ia": f"Resposta IA inválida (parser). Heurística: {why}",
+                    "origem": "fallback_parser",
+                }
+            )
         return out
 
     results = data.get("items", [])
@@ -521,13 +604,15 @@ def ai_classify_batch(items: List[Dict[str, Any]], model: str) -> List[Dict[str,
         r = by_id.get(it.get("id"))
         if not r:
             cat, conf, why = heuristic_category(it.get("desc", ""))
-            out.append({
-                "id": it.get("id"),
-                "categoria_fiscal_ia": cat,
-                "confianca_ia": float(conf),
-                "motivo_ia": f"IA sem item correspondente. Heurística: {why}",
-                "origem": "fallback_sem_item",
-            })
+            out.append(
+                {
+                    "id": it.get("id"),
+                    "categoria_fiscal_ia": cat,
+                    "confianca_ia": float(conf),
+                    "motivo_ia": f"IA sem item correspondente. Heurística: {why}",
+                    "origem": "fallback_sem_item",
+                }
+            )
             continue
 
         cat = (r.get("categoria_fiscal_ia") or "SVA_OUTROS").strip()
@@ -541,21 +626,21 @@ def ai_classify_batch(items: List[Dict[str, Any]], model: str) -> List[Dict[str,
         conf = max(0.0, min(1.0, conf))
         motivo = (r.get("motivo_ia") or "").strip()[:220]
 
-        out.append({
-            "id": it.get("id"),
-            "categoria_fiscal_ia": cat,
-            "confianca_ia": conf,
-            "motivo_ia": motivo,
-            "origem": "openai",
-        })
-
+        out.append(
+            {
+                "id": it.get("id"),
+                "categoria_fiscal_ia": cat,
+                "confianca_ia": conf,
+                "motivo_ia": motivo,
+                "origem": "openai",
+            }
+        )
     return out
 
 
 # =========================================================
 # Items extraction + correction + per-XML change log
 # =========================================================
-
 def extract_items_nfcom(tree: etree._ElementTree, file_name: str) -> List[Dict[str, Any]]:
     root = tree.getroot()
     ns = get_ns(tree)
@@ -565,23 +650,28 @@ def extract_items_nfcom(tree: etree._ElementTree, file_name: str) -> List[Dict[s
         cclass = first_text(det, ns, "./n:prod/n:cClass | ./prod/cClass")
         xprod = first_text(det, ns, "./n:prod/n:xProd | ./prod/xProd")
         cfop = first_text(det, ns, "./n:prod/n:CFOP | ./prod/CFOP")
+
         vitem = to_float(first_text(det, ns, "./n:prod/n:vItem | ./prod/vItem"))
         vprod = to_float(first_text(det, ns, "./n:prod/n:vProd | ./prod/vProd"))
         vdesc = to_float(first_text(det, ns, "./n:prod/n:vDesc | ./prod/vDesc"))
         vout = to_float(first_text(det, ns, "./n:prod/n:vOutro | ./prod/vOutro"))
-        items.append({
-            "arquivo": file_name,
-            "item": idx,
-            "cClass": cclass,
-            "descricao": xprod,
-            "CFOP": cfop,
-            "vItem": float(vitem),
-            "vProd": float(vprod),
-            "vDesc": float(vdesc),
-            "vOutros": float(vout),
-            "vServ": float(vprod),
-        })
+
+        items.append(
+            {
+                "arquivo": file_name,
+                "item": idx,
+                "cClass": cclass,
+                "descricao": xprod,
+                "CFOP": cfop,
+                "vItem": float(vitem),
+                "vProd": float(vprod),
+                "vDesc": float(vdesc),
+                "vOutros": float(vout),
+                "vServ": float(vprod),
+            }
+        )
     return items
+
 
 def simulate_and_or_correct_xml_nfcom(
     tree: etree._ElementTree,
@@ -590,6 +680,12 @@ def simulate_and_or_correct_xml_nfcom(
     corrigir_descontos: bool,
     apply_changes: bool,
 ) -> Tuple[bytes, List[Dict[str, Any]], bool]:
+    """
+    Retorna:
+      - xml_saida (original se apply_changes=False; corrigido se True)
+      - changes (lista detalhada do que mudaria/mudou)
+      - changed_flag (True se existe alguma mudança)
+    """
     root = tree.getroot()
     original_xml = etree.tostring(tree, encoding="utf-8", xml_declaration=True)
 
@@ -598,6 +694,7 @@ def simulate_and_or_correct_xml_nfcom(
     ns = get_ns(new_tree)
 
     decisions = {int(r["item"]): (str(r["categoria_fiscal_ia"]), float(r["confianca_ia"])) for _, r in df_dec.iterrows()}
+
     dets = xp(copy_root, ns, ".//n:det | .//det")
     changes: List[Dict[str, Any]] = []
 
@@ -609,11 +706,13 @@ def simulate_and_or_correct_xml_nfcom(
             cfop_nodes = xp(det, ns, "./n:prod/n:CFOP | ./prod/CFOP")
             if cfop_nodes:
                 old_cfop = (cfop_nodes[0].text or "").strip()
-                changes.append({
-                    "item": idx,
-                    "acao": "REMOVER_CFOP_SVA",
-                    "detalhe": f"Remover CFOP='{old_cfop}' (cat={cat}, conf={conf:.2f})",
-                })
+                changes.append(
+                    {
+                        "item": idx,
+                        "acao": "REMOVER_CFOP_SVA",
+                        "detalhe": f"Remover CFOP='{old_cfop}' (cat={cat}, conf={conf:.2f})",
+                    }
+                )
                 if apply_changes:
                     for node in cfop_nodes:
                         parent = node.getparent()
@@ -630,11 +729,13 @@ def simulate_and_or_correct_xml_nfcom(
                 vi = to_float(vi_text)
                 vp = to_float(vp_text)
                 if vp < vi:
-                    changes.append({
-                        "item": idx,
-                        "acao": "AJUSTAR_VPROD",
-                        "detalhe": f"vProd {vp_text} -> {vi_text} (paliativo desconto)",
-                    })
+                    changes.append(
+                        {
+                            "item": idx,
+                            "acao": "AJUSTAR_VPROD",
+                            "detalhe": f"vProd {vp_text} -> {vi_text} (paliativo desconto)",
+                        }
+                    )
                     if apply_changes:
                         vprod_nodes[0].text = vi_text
 
@@ -649,7 +750,6 @@ def simulate_and_or_correct_xml_nfcom(
 # =========================================================
 # Excel report (openpyxl)
 # =========================================================
-
 def generate_excel_report(**dfs) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -665,7 +765,6 @@ def generate_excel_report(**dfs) -> bytes:
 # =========================================================
 # Main UI
 # =========================================================
-
 def main():
     training_init()
 
@@ -685,36 +784,45 @@ def main():
         "Correção dos XMLs",
         options=["Aplicar correções no XML", "Apenas sugerir (não altera XML)"],
         index=0,
-        help="Se 'Apenas sugerir', o ZIP contém os XMLs originais, mas com logs de mudanças sugeridas."
+        help="Se 'Apenas sugerir', o ZIP contém os XMLs originais, mas com logs de mudanças sugeridas.",
+        key="radio_apply_changes",
     ) == "Aplicar correções no XML"
 
-    corrigir_descontos = st.sidebar.checkbox("Paliativo descontos: vProd = vItem quando vProd < vItem", value=False)
+    corrigir_descontos = st.sidebar.checkbox(
+        "Paliativo descontos: vProd = vItem quando vProd < vItem", value=False, key="chk_descontos"
+    )
 
-    enable_ai = st.sidebar.checkbox("Ativar IA (OpenAI) para classificação", value=True)
-    ai_model = st.sidebar.text_input("Modelo OpenAI", value="gpt-4o-mini")
+    enable_ai = st.sidebar.checkbox("Ativar IA (OpenAI) para classificação", value=True, key="chk_ai")
+    ai_model = st.sidebar.text_input("Modelo OpenAI", value="gpt-4o-mini", key="txt_ai_model")
 
-    corr_auto_threshold = st.sidebar.slider("Limiar para remover CFOP do SVA (confiança mínima)", 0.50, 1.00, 0.95, 0.01)
-    suggest_threshold = st.sidebar.slider("Limiar para sugestão forte (sem IA)", 0.50, 1.00, 0.85, 0.01)
+    corr_auto_threshold = st.sidebar.slider(
+        "Limiar para remover CFOP do SVA (confiança mínima)", 0.50, 1.00, 0.95, 0.01, key="sld_cfop_threshold"
+    )
+    suggest_threshold = st.sidebar.slider(
+        "Limiar para sugestão forte (sem IA)", 0.50, 1.00, 0.85, 0.01, key="sld_suggest_threshold"
+    )
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("Base de aprendizado (SCM/SVA)")
 
-    # ✅ uploader atualizado (CSV ou XLSX)
-    up_train = st.sidebar.file_uploader("Importar base (CSV ou XLSX)", type=["csv", "xlsx"])
+    up_train = st.sidebar.file_uploader("Importar base (CSV ou XLSX)", type=["csv", "xlsx"], key="up_train")
     if up_train is not None:
         ok, msg = training_merge_uploaded(up_train)
-        st.sidebar.success(msg) if ok else st.sidebar.error(msg)
+        if ok:
+            st.sidebar.success(msg)
+        else:
+            st.sidebar.error(msg)
 
     df_train = training_load()
     st.sidebar.download_button(
         "Baixar base (CSV)",
         data=df_train.to_csv(index=False).encode("utf-8"),
         file_name="training_data.csv",
-        key="dl_training_csv"
+        key="dl_training_csv",
     )
 
     st.sidebar.markdown("---")
-    cancel_file = st.sidebar.file_uploader("Chaves canceladas (CSV/TXT)", type=["csv", "txt"])
+    cancel_file = st.sidebar.file_uploader("Chaves canceladas (CSV/TXT)", type=["csv", "txt"], key="up_cancel")
     cancel_keys = set()
     if cancel_file is not None:
         raw = cancel_file.read()
@@ -724,9 +832,18 @@ def main():
             text = raw.decode("latin1", errors="ignore")
         cancel_keys = set(re.findall(r"\d{44}", text))
 
-    uploaded = st.file_uploader("Envie XML (NFCom) ou ZIP com XMLs", type=["xml", "zip"], accept_multiple_files=True)
+    uploaded = st.file_uploader(
+        "Envie XML (NFCom) ou ZIP com XMLs",
+        type=["xml", "zip"],
+        accept_multiple_files=True,
+        key="up_xml",
+    )
 
-    process_btn = st.button("Processar lote", type="primary", disabled=not bool(uploaded))
+    process_btn = st.button("Processar lote", type="primary", disabled=not bool(uploaded), key="btn_processar")
+
+    # =======================
+    # PROCESSAMENTO DO LOTE
+    # =======================
     if process_btn and uploaded:
         items_all: List[Dict[str, Any]] = []
         xml_ativos: List[Dict[str, Any]] = []
@@ -816,17 +933,21 @@ def main():
         if enable_ai and not df_need.empty:
             batch = [{"id": r["id_desc"], "desc": r["descricao"], "cClass": r.get("cClass", ""), "cfop": r.get("CFOP", "")} for _, r in df_need.iterrows()]
             for i in range(0, len(batch), 50):
-                chunk = batch[i:i + 50]
+                chunk = batch[i : i + 50]
                 for r in ai_classify_batch(chunk, model=ai_model):
                     ai_by_id[r["id"]] = r
 
         def decide_row(r):
             if r.get("categoria_training", "") in AI_ALLOWED:
-                cat = r["categoria_training"]; conf = 1.0
-                motivo = "Aprovação do escritório (base de aprendizado)"; origem = "aprendizado"
+                cat = r["categoria_training"]
+                conf = 1.0
+                motivo = "Aprovação do escritório (base de aprendizado)"
+                origem = "aprendizado"
             else:
-                cat = r["categoria_heur"]; conf = float(r["confianca_heur"])
-                motivo = r["motivo_heur"]; origem = "heuristica"
+                cat = r["categoria_heur"]
+                conf = float(r["confianca_heur"])
+                motivo = r["motivo_heur"]
+                origem = "heuristica"
                 ai = ai_by_id.get(r["id_desc"])
                 if ai is not None and conf < 0.95:
                     cat = ai.get("categoria_fiscal_ia", cat)
@@ -839,11 +960,13 @@ def main():
 
         df_items[["categoria_fiscal_ia", "confianca_ia", "motivo_ia", "origem_ia"]] = df_items.apply(decide_row, axis=1)
 
+        # Fila de revisão (será exibida consolidada)
         df_revisar = df_items.loc[
             (df_items["origem_ia"] != "aprendizado") & (df_items["confianca_ia"].astype(float) < corr_auto_threshold),
-            ["arquivo", "item", "descricao", "cClass", "CFOP", "categoria_fiscal_ia", "confianca_ia", "motivo_ia", "origem_ia", "vServ", "desc_norm"]
+            ["arquivo", "item", "descricao", "cClass", "CFOP", "categoria_fiscal_ia", "confianca_ia", "motivo_ia", "origem_ia", "vServ", "desc_norm"],
         ].copy()
 
+        # Pré-gerar logs e XMLs para preview e downloads
         per_file = []
         changes_all = []
         for x in xml_ativos:
@@ -863,29 +986,37 @@ def main():
 
             orig_bytes = etree.tostring(tree, encoding="utf-8", xml_declaration=True)
 
-            per_file.append({
-                "arquivo": logical,
-                "base_name": base,
-                "chave": x.get("chave", ""),
-                "changed": bool(changed_flag),
-                "changes_count": len(changes),
-                "xml_original": orig_bytes,
-                "xml_saida": xml_out,
-            })
-
-            for c in changes:
-                changes_all.append({
+            per_file.append(
+                {
                     "arquivo": logical,
                     "base_name": base,
                     "chave": x.get("chave", ""),
-                    "item": c.get("item"),
-                    "acao": c.get("acao"),
-                    "detalhe": c.get("detalhe"),
-                    "modo": "APLICADO" if apply_changes else "SUGERIDO",
-                })
+                    "changed": bool(changed_flag),
+                    "changes_count": len(changes),
+                    "xml_original": orig_bytes,
+                    "xml_saida": xml_out,
+                }
+            )
+
+            for c in changes:
+                changes_all.append(
+                    {
+                        "arquivo": logical,
+                        "base_name": base,
+                        "chave": x.get("chave", ""),
+                        "item": c.get("item"),
+                        "acao": c.get("acao"),
+                        "detalhe": c.get("detalhe"),
+                        "modo": "APLICADO" if apply_changes else "SUGERIDO",
+                    }
+                )
 
         df_files = pd.DataFrame(per_file)
-        df_changes = pd.DataFrame(changes_all) if changes_all else pd.DataFrame(columns=["arquivo", "base_name", "chave", "item", "acao", "detalhe", "modo"])
+        df_changes = (
+            pd.DataFrame(changes_all)
+            if changes_all
+            else pd.DataFrame(columns=["arquivo", "base_name", "chave", "item", "acao", "detalhe", "modo"])
+        )
 
         st.session_state["results"] = {
             "empty": False,
@@ -903,7 +1034,9 @@ def main():
         st.session_state["processed"] = True
         st.rerun()
 
-    # Render state
+    # =======================
+    # RENDER (state)
+    # =======================
     if not st.session_state.get("processed") or not st.session_state.get("results"):
         st.info("Envie os arquivos e clique em **Processar lote**.")
         return
@@ -928,40 +1061,125 @@ def main():
     month_ref = res.get("month_ref", "")
     apply_changes = bool(res.get("apply_changes", True))
 
-    st.subheader("Fila de revisão (aprove e o sistema aprende)")
+    # =========================================================
+    # ✅ FILA DE REVISÃO CONSOLIDADA
+    # =========================================================
+    st.subheader("Fila de revisão (consolidada por item) — aprove e o sistema aprende")
+
     if df_revisar.empty:
         st.success("Nenhum item precisa de revisão neste lote.")
     else:
-        editor_df = df_revisar[["arquivo", "item", "descricao", "cClass", "categoria_fiscal_ia", "confianca_ia", "origem_ia", "vServ"]].copy()
-        editor_df["categoria_aprovada"] = editor_df["categoria_fiscal_ia"]
+        df_rev = df_revisar.copy()
+
+        def _join_unique(series, max_items=6):
+            vals = [str(v).strip() for v in series.dropna().unique().tolist() if str(v).strip()]
+            if not vals:
+                return ""
+            vals = vals[:max_items]
+            return " | ".join(vals)
+
+        df_consol = (
+            df_rev.groupby("desc_norm", as_index=False)
+            .agg(
+                descricao_exemplo=("descricao", "first"),
+                categoria_sugerida=("categoria_fiscal_ia", "first"),
+                confianca_min=("confianca_ia", "min"),
+                confianca_media=("confianca_ia", "mean"),
+                qtd_ocorrencias=("desc_norm", "size"),
+                total_vServ=("vServ", "sum"),
+                cClass_distintos=("cClass", _join_unique),
+                CFOP_distintos=("CFOP", _join_unique),
+            )
+        )
+        df_consol["categoria_aprovada"] = df_consol["categoria_sugerida"]
+
+        st.caption(
+            "A tabela abaixo consolida itens repetidos (mesma descrição normalizada). "
+            "Ao aprovar uma categoria, ela será aplicada a TODAS as ocorrências iguais no lote."
+        )
+
         edited = st.data_editor(
-            editor_df,
+            df_consol[
+                [
+                    "descricao_exemplo",
+                    "categoria_sugerida",
+                    "categoria_aprovada",
+                    "confianca_min",
+                    "qtd_ocorrencias",
+                    "total_vServ",
+                    "cClass_distintos",
+                    "CFOP_distintos",
+                ]
+            ],
             use_container_width=True,
             num_rows="dynamic",
-            column_config={"categoria_aprovada": st.column_config.SelectboxColumn("categoria_aprovada", options=CATEGORIES, required=True)},
-            key="editor_revisao",
+            column_config={
+                "categoria_aprovada": st.column_config.SelectboxColumn(
+                    "categoria_aprovada", options=CATEGORIES, required=True
+                )
+            },
+            key="editor_revisao_consolidada",
         )
-        if st.button("Salvar aprovações na base"):
-            merged = df_revisar.merge(edited[["arquivo", "item", "categoria_aprovada"]], on=["arquivo", "item"], how="left")
+
+        if st.button("Salvar aprovações (aplica em massa no lote + aprende)", key="btn_salvar_aprovacoes"):
+            df_consol_edit = df_consol.copy()
+            df_consol_edit["categoria_aprovada"] = edited["categoria_aprovada"].values
+
+            map_aprov = dict(zip(df_consol_edit["desc_norm"], df_consol_edit["categoria_aprovada"]))
+
+            # aplica em massa no df_items
+            df_items_local = st.session_state["results"]["df_items"].copy()
+            mask = df_items_local["desc_norm"].isin(map_aprov.keys())
+
+            df_items_local.loc[mask, "categoria_fiscal_ia"] = df_items_local.loc[mask, "desc_norm"].map(map_aprov)
+            df_items_local.loc[mask, "confianca_ia"] = 1.0
+            df_items_local.loc[mask, "motivo_ia"] = "Aprovado manualmente (consolidado)"
+            df_items_local.loc[mask, "origem_ia"] = "aprendizado"
+
+            # salva aprendizado (1 por desc_norm)
             now = datetime.now().isoformat(timespec="seconds")
             rows = []
-            for _, rr in merged.iterrows():
-                cat = rr.get("categoria_aprovada", "")
-                if cat in AI_ALLOWED and rr.get("desc_norm", ""):
-                    rows.append({
-                        "emit_cnpj": client_cnpj or "",
-                        "desc_norm": rr["desc_norm"],
-                        "descricao_exemplo": (rr.get("descricao", "") or "")[:250],
-                        "categoria_aprovada": cat,
-                        "created_at": now,
-                        "source": "aprovacao_app",
-                    })
+            for dn, cat in map_aprov.items():
+                if cat in AI_ALLOWED and dn:
+                    exemplo = (
+                        df_items_local.loc[df_items_local["desc_norm"] == dn, "descricao"]
+                        .astype(str)
+                        .head(1)
+                        .tolist()
+                    )
+                    rows.append(
+                        {
+                            "emit_cnpj": st.session_state["results"].get("client_cnpj", "") or "",
+                            "desc_norm": dn,
+                            "descricao_exemplo": (exemplo[0] if exemplo else "")[:250],
+                            "categoria_aprovada": cat,
+                            "created_at": now,
+                            "source": "aprovacao_consolidada",
+                        }
+                    )
             if rows:
                 training_append(rows)
-                st.success(f"Aprovações salvas: {len(rows)}. Reprocessar aplicará 100% de confiança nessas descrições.")
-            else:
-                st.warning("Nenhuma aprovação válida selecionada.")
 
+            # atualiza estado
+            st.session_state["results"]["df_items"] = df_items_local
+
+            # recalcula fila de revisão
+            df_revisar_now = df_items_local.loc[
+                (df_items_local["origem_ia"] != "aprendizado")
+                & (df_items_local["confianca_ia"].astype(float) < float(st.session_state.get("sld_cfop_threshold", 0.95))),
+                ["arquivo", "item", "descricao", "cClass", "CFOP", "categoria_fiscal_ia", "confianca_ia", "motivo_ia", "origem_ia", "vServ", "desc_norm"],
+            ].copy()
+            st.session_state["results"]["df_revisar"] = df_revisar_now
+
+            st.success(
+                f"Aprovações aplicadas em massa e salvas na base. "
+                f"Itens únicos aprovados: {len(map_aprov)} | Ocorrências impactadas: {int(mask.sum())}"
+            )
+            st.rerun()
+
+    # =========================================================
+    # Dashboard do lote
+    # =========================================================
     st.subheader("Dashboard do lote")
     total_docs = int(len(df_files))
     total_changed = int(df_files["changed"].sum()) if "changed" in df_files.columns else 0
@@ -977,14 +1195,20 @@ def main():
     st.dataframe(df_cat, use_container_width=True)
     st.bar_chart(df_cat.set_index("categoria_fiscal_ia")["total_vServ"])
 
+    # =========================================================
+    # Log de mudanças por XML
+    # =========================================================
     st.subheader("Log de mudanças por XML")
     if df_changes.empty:
         st.info("Nenhuma mudança proposta/aplicada neste lote.")
     else:
         st.dataframe(df_changes, use_container_width=True)
 
+    # =========================================================
+    # Pré-visualização (antes de baixar)
+    # =========================================================
     st.subheader("Pré-visualização (antes de baixar)")
-    st.caption("Selecione um XML e veja: mudanças + XML original vs XML de saída.")
+    st.caption("Selecione um XML e veja: mudanças propostas/aplicadas + XML original vs XML de saída.")
 
     opts = df_files["arquivo"].tolist()
     sel = st.selectbox("Escolha o arquivo", options=opts, key="preview_file")
@@ -995,7 +1219,7 @@ def main():
         st.write("**Resumo**")
         st.write(f"- Base: `{row['base_name']}`")
         st.write(f"- Chave: `{row.get('chave','')}`")
-        st.write(f"- Mudanças: **{int(row.get('changes_count', 0))}**")
+        st.write(f"- Mudanças: **{int(row.get('changes_count',0))}**")
         st.write(f"- Modo: **{'Aplicado' if apply_changes else 'Apenas sugerido'}**")
 
         df_c = df_changes[df_changes["arquivo"] == sel].copy() if not df_changes.empty else pd.DataFrame()
@@ -1008,23 +1232,27 @@ def main():
     with colB:
         tab1, tab2 = st.tabs(["XML original", "XML de saída"])
         with tab1:
-            st.text_area("original", value=row["xml_original"].decode("utf-8", errors="ignore"), height=420)
+            st.text_area("original", value=(row["xml_original"].decode("utf-8", errors="ignore")), height=420)
         with tab2:
-            st.text_area("saida", value=row["xml_saida"].decode("utf-8", errors="ignore"), height=420)
+            st.text_area("saida", value=(row["xml_saida"].decode("utf-8", errors="ignore")), height=420)
 
+    # =========================================================
+    # Downloads
+    # =========================================================
     st.subheader("Downloads")
 
     def build_zip(filter_mode: str) -> bytes:
+        """
+        filter_mode:
+          - 'todos'
+          - 'somente_corrigidos' (changed=True)
+          - 'somente_sem_mudanca' (changed=False)
+        Sempre inclui: status_por_xml.csv e log_mudancas.csv
+        """
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-            z.writestr(
-                "status_por_xml.csv",
-                df_files[["arquivo", "base_name", "chave", "changed", "changes_count"]].to_csv(index=False)
-            )
-            z.writestr(
-                "log_mudancas.csv",
-                df_changes.to_csv(index=False) if not df_changes.empty else "arquivo,base_name,chave,item,acao,detalhe,modo\n"
-            )
+            z.writestr("status_por_xml.csv", df_files[["arquivo", "base_name", "chave", "changed", "changes_count"]].to_csv(index=False))
+            z.writestr("log_mudancas.csv", df_changes.to_csv(index=False) if not df_changes.empty else "arquivo,base_name,chave,item,acao,detalhe,modo\n")
 
             for _, r in df_files.iterrows():
                 if filter_mode == "somente_corrigidos" and not bool(r["changed"]):
@@ -1039,25 +1267,41 @@ def main():
         out.seek(0)
         return out.read()
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.download_button("Baixar ZIP – Todos ativos", data=build_zip("todos"), file_name="xml_ativos.zip", mime="application/zip", key="dl_zip_todos")
-    with col2:
-        st.download_button("Baixar ZIP – Somente com mudança", data=build_zip("somente_corrigidos"), file_name="xml_somente_mudanca.zip", mime="application/zip", key="dl_zip_mudanca")
-    with col3:
-        st.download_button("Baixar ZIP – Somente sem mudança", data=build_zip("somente_sem_mudanca"), file_name="xml_sem_mudanca.zip", mime="application/zip", key="dl_zip_sem_mudanca")
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        st.download_button(
+            "Baixar ZIP – Todos ativos",
+            data=build_zip("todos"),
+            file_name="xml_ativos.zip",
+            mime="application/zip",
+            key="dl_zip_todos",
+        )
+    with d2:
+        st.download_button(
+            "Baixar ZIP – Somente com mudança",
+            data=build_zip("somente_corrigidos"),
+            file_name="xml_somente_mudanca.zip",
+            mime="application/zip",
+            key="dl_zip_mudanca",
+        )
+    with d3:
+        st.download_button(
+            "Baixar ZIP – Somente sem mudança",
+            data=build_zip("somente_sem_mudanca"),
+            file_name="xml_sem_mudanca.zip",
+            mime="application/zip",
+            key="dl_zip_sem_mudanca",
+        )
 
+    # =========================================================
+    # Relatório Excel
+    # =========================================================
     st.markdown("---")
     st.subheader("Relatório (Excel)")
     try:
         excel = generate_excel_report(
-            Resumo=pd.DataFrame([{
-                "cliente_cnpj": client_cnpj,
-                "cliente_nome": client_nome,
-                "competencia": month_ref,
-                "modo": "APLICADO" if apply_changes else "SUGERIDO"
-            }]),
-            Detalhamento_Itens=df_items.drop(columns=["desc_norm"], errors="ignore"),
+            Resumo=pd.DataFrame([{"cliente_cnpj": client_cnpj, "cliente_nome": client_nome, "competencia": month_ref, "modo": "APLICADO" if apply_changes else "SUGERIDO"}]),
+            Detalhamento_Itens=df_items.drop(columns=["desc_norm", "id_desc"], errors="ignore"),
             Resumo_Categoria=df_cat,
             Arquivos_Status=df_files[["arquivo", "base_name", "chave", "changed", "changes_count"]],
             Log_Mudancas=df_changes,
