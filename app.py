@@ -90,6 +90,16 @@ def normalize_text(s: str) -> str:
     return s
 
 
+def strip_noise_desc(s: str) -> str:
+    """Remove ruídos comuns (endereços/números) para ajudar IA/heurística."""
+    t = normalize_text(s or "")
+    t = re.sub(r"[^\w\s]", " ", t)
+    t = re.sub(r"\b(rua|avenida|av|rodovia|km|casa|apto|apartamento|bloco|cep|bairro|cidade|loja)\b", " ", t)
+    t = re.sub(r"\b\d{2,}\b", " ", t)  # remove números longos
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
 def to_float(x) -> float:
     try:
         if x is None:
@@ -97,6 +107,13 @@ def to_float(x) -> float:
         return float(str(x).replace(",", "."))
     except Exception:
         return 0.0
+
+
+def safe_float(x, default=0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
 
 
 def num_to_br(x) -> str:
@@ -187,6 +204,50 @@ def get_competencia_mes(tree: etree._ElementTree) -> str:
     if m:
         return f"{m.group(1)}-{m.group(2)}"
     return datetime.now().strftime("%Y-%m")
+
+
+def is_dest_pf_or_pj_nao_contrib(tree: etree._ElementTree) -> bool:
+    """
+    Regra conservadora:
+      - CPF com indIEDest vazio/2/9 => não contrib
+      - CNPJ com indIEDest 9 => não contrib
+    """
+    root = tree.getroot()
+    ns = get_ns(tree)
+
+    dest = xp(root, ns, ".//n:dest | .//dest")
+    if not dest:
+        return False
+    d = dest[0]
+
+    cpf = first_text(d, ns, "./n:CPF | ./CPF")
+    cnpj = first_text(d, ns, "./n:CNPJ | ./CNPJ")
+    ind = first_text(d, ns, "./n:indIEDest | ./indIEDest")
+
+    if cpf and (not ind or ind in ("2", "9")):
+        return True
+    if cnpj and ind == "9":
+        return True
+    return False
+
+
+def expected_cfop_scm_pf(tree: etree._ElementTree) -> Optional[str]:
+    """
+    Se PF/PJ não contribuinte, retorna CFOP esperado:
+      - 5307 se UF emitente = UF destinatário
+      - 6307 caso contrário
+    """
+    root = tree.getroot()
+    ns = get_ns(tree)
+
+    uf_emit = first_text(root, ns, ".//n:emit/n:enderEmit/n:UF | .//emit/enderEmit/UF")
+    uf_dest = first_text(root, ns, ".//n:dest/n:enderDest/n:UF | .//dest/enderDest/UF")
+
+    if not uf_emit or not uf_dest:
+        return None
+    if uf_emit == uf_dest:
+        return "5307"
+    return "6307"
 
 
 # =========================
@@ -420,7 +481,7 @@ SVA_GENERIC = ["antivirus", "backup", "email", "ip fixo", "suporte", "cloud", "v
 
 
 def heuristic_category(desc: str) -> Tuple[str, float, str]:
-    d = normalize_text(desc)
+    d = strip_noise_desc(desc)
     if not d:
         return ("SVA_OUTROS", 0.50, "Descrição vazia")
     if any(k in d for k in SCM_KEYWORDS) and not any(k in d for k in SVA_GENERIC):
@@ -439,7 +500,7 @@ def heuristic_category(desc: str) -> Tuple[str, float, str]:
 # =========================
 # OpenAI (Consolidado)
 # =========================
-AI_SYSTEM_CONSOL = """Você é especialista fiscal em NFCom (Modelo 62).
+AI_SYSTEM_CONSOL = """Você é especialista fiscal em NFCom (Modelo 62) e atua de forma CONSERVADORA.
 Classifique ITENS CONSOLIDADOS em UMA categoria:
 - SCM
 - SVA_EBOOK
@@ -447,18 +508,27 @@ Classifique ITENS CONSOLIDADOS em UMA categoria:
 - SVA_TV_STREAMING
 - SVA_OUTROS
 
-Considere juntos:
-- DESCRIÇÃO
-- cClass (sinal fiscal forte; divergência com descrição reduz confiança)
-- CFOP (apenas SCM deve ter CFOP; SVA idealmente sem CFOP)
-- volume (ocorrências e total)
+Você receberá por item:
+- descricao_exemplo (texto original)
+- descricao_core (texto limpo, sem ruídos)
+- cClass_distintos + cClass_top (distribuição)
+- CFOP_distintos + CFOP_top + cfop_fill_rate (distribuição)
+- volume: qtd_ocorrencias e total_vServ
+- categoria_atual (sugestão atual do validador)
 
-Regras:
-- Só dê alta confiança (>=0.90) quando descrição + cClass forem coerentes.
-- Se ambíguo, use SVA_OUTROS com baixa confiança e explique.
+Regras IMPORTANTES:
+1) CFOP PODE estar errado. Não assuma que CFOP correto => SCM. Use CFOP como SINAL, junto com os demais dados.
+2) cClass é sinal fiscal forte, mas clientes podem trocar cClass. Use a COERÊNCIA entre descricao_core + cClass_top + padrão de CFOP.
+3) Só retorne alta confiança (>=0.90) se houver COERÊNCIA forte entre descricao_core e cClass_top.
+4) Se ambíguo ou fraco, prefira MANTER categoria_atual e use baixa confiança (<=0.75).
+5) Para SVA, escolha subcategoria:
+   - EBOOK: ebook, livros digitais, biblioteca
+   - LOCACAO: aluguel/locação/roteador/onu/cpe
+   - TV_STREAMING: tv/iptv/streaming/conteúdo
+   - OUTROS: demais
 
-Retorne SOMENTE JSON válido no formato:
-{"items":[{"id":"...","ia_sugestao":"SCM|SVA_EBOOK|SVA_LOCACAO|SVA_TV_STREAMING|SVA_OUTROS","ia_confianca":0.0-1.0,"ia_motivo":"..."}]}
+Saída: retorne SOMENTE JSON válido no formato:
+{"items":[{"id":"...","ia_sugestao":"SCM|SVA_EBOOK|SVA_LOCACAO|SVA_TV_STREAMING|SVA_OUTROS","ia_confianca":0.0,"ia_motivo":"..."}]}
 """
 
 
@@ -472,6 +542,18 @@ def get_openai_client():
     if not key or OpenAI is None:
         return None
     return OpenAI(api_key=key)
+
+
+def openai_diag() -> Dict[str, Any]:
+    """Retorna diagnóstico do ambiente OpenAI sem vazar chave."""
+    info = {"openai_lib": bool(OpenAI is not None), "has_secret": False, "has_env": False, "client_ok": False}
+    try:
+        info["has_secret"] = bool(st.secrets.get("OPENAI_API_KEY", None))
+    except Exception:
+        info["has_secret"] = False
+    info["has_env"] = bool(os.environ.get("OPENAI_API_KEY"))
+    info["client_ok"] = bool(get_openai_client() is not None)
+    return info
 
 
 def _strip_fences(t: str) -> str:
@@ -506,7 +588,7 @@ def _extract_json_object(t: str) -> Optional[str]:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    return t[start : i + 1]
+                    return t[start: i + 1]
     return None
 
 
@@ -532,6 +614,29 @@ def _safe_json_loads(t: str) -> Optional[dict]:
     return None
 
 
+def openai_safe_call(client, model: str, system: str, payload: dict, max_tokens: int = 2000) -> Tuple[Optional[dict], str]:
+    """
+    Faz a chamada OpenAI e devolve:
+      - dict JSON (ou None)
+      - texto bruto de saída (para debug)
+    """
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}
+            ],
+            temperature=0.0,
+            max_output_tokens=max_tokens,
+        )
+        raw = (resp.output_text or "").strip()
+        data = _safe_json_loads(raw)
+        return data, raw[:4000]
+    except Exception as e:
+        return None, f"[OpenAI ERROR] {type(e).__name__}: {e}"
+
+
 def ai_classify_consolidated(df_consol: pd.DataFrame, model: str) -> pd.DataFrame:
     df = df_consol.copy()
     if df.empty:
@@ -554,11 +659,16 @@ def ai_classify_consolidated(df_consol: pd.DataFrame, model: str) -> pd.DataFram
 
     items = []
     for i, r in df.iterrows():
+        dn = str(r.get("desc_norm", "") or "")
         items.append({
-            "id": str(r.get("desc_norm", ""))[:120] or f"row_{i}",
-            "descricao_exemplo": str(r.get("descricao_exemplo", ""))[:240],
-            "cClass_distintos": str(r.get("cClass_distintos", ""))[:220],
-            "CFOP_distintos": str(r.get("CFOP_distintos", ""))[:220],
+            "id": dn,  # join exato por desc_norm
+            "descricao_exemplo": str(r.get("descricao_exemplo", ""))[:400],
+            "descricao_core": str(r.get("descricao_core", ""))[:400],
+            "cClass_distintos": str(r.get("cClass_distintos", ""))[:400],
+            "cClass_top": str(r.get("cClass_top", ""))[:400],
+            "CFOP_distintos": str(r.get("CFOP_distintos", ""))[:400],
+            "CFOP_top": str(r.get("CFOP_top", ""))[:400],
+            "cfop_fill_rate": safe_float(r.get("cfop_fill_rate", 0.0), 0.0),
             "qtd_ocorrencias": int(r.get("qtd_ocorrencias", 0) or 0),
             "total_vServ": float(r.get("total_vServ", 0.0) or 0.0),
             "categoria_atual": str(r.get("categoria_sugerida", ""))[:30],
@@ -566,22 +676,19 @@ def ai_classify_consolidated(df_consol: pd.DataFrame, model: str) -> pd.DataFram
 
     out_rows = []
     for start in range(0, len(items), 35):
-        chunk = items[start:start+35]
-        resp = client.responses.create(
-            model=model,
-            input=[
-                {"role": "system", "content": AI_SYSTEM_CONSOL},
-                {"role": "user", "content": json.dumps({"items": chunk}, ensure_ascii=False)}
-            ],
-            temperature=0.0,
-            max_output_tokens=2000,
-        )
-        data = _safe_json_loads(resp.output_text or "")
+        chunk = items[start:start + 35]
+        data, raw = openai_safe_call(client, model=model, system=AI_SYSTEM_CONSOL, payload={"items": chunk}, max_tokens=2000)
+        st.session_state["AI_LAST_RAW"] = raw
+
         if not data or "items" not in data:
-            # fallback do chunk
             for it in chunk:
                 cat, c, why = heuristic_category(it.get("descricao_exemplo", ""))
-                out_rows.append({"id": it["id"], "ia_sugestao": cat, "ia_confianca": float(c), "ia_motivo": f"Falha IA. Heurística: {why}"})
+                out_rows.append({
+                    "id": it["id"],
+                    "ia_sugestao": cat,
+                    "ia_confianca": float(c),
+                    "ia_motivo": f"Falha IA. Heurística: {why}"
+                })
             continue
 
         got = data.get("items", [])
@@ -601,10 +708,8 @@ def ai_classify_consolidated(df_consol: pd.DataFrame, model: str) -> pd.DataFram
             out_rows.append({"id": it["id"], "ia_sugestao": sug, "ia_confianca": c, "ia_motivo": motivo})
 
     out_df = pd.DataFrame(out_rows)
-    df["_id_join"] = df["desc_norm"].astype(str).str.slice(0, 120)
-    out_df["_id_join"] = out_df["id"].astype(str).str.slice(0, 120)
-    df = df.merge(out_df[["_id_join", "ia_sugestao", "ia_confianca", "ia_motivo"]], on="_id_join", how="left")
-    df.drop(columns=["_id_join"], inplace=True)
+    df = df.merge(out_df[["id", "ia_sugestao", "ia_confianca", "ia_motivo"]], left_on="desc_norm", right_on="id", how="left")
+    df.drop(columns=["id"], inplace=True)
     df["ia_sugestao"] = df["ia_sugestao"].fillna("")
     df["ia_confianca"] = df["ia_confianca"].fillna(0.0)
     df["ia_motivo"] = df["ia_motivo"].fillna("")
@@ -653,7 +758,9 @@ def simulate_and_or_correct_xml_nfcom(
 ) -> Tuple[bytes, List[Dict[str, Any]], bool]:
     """
     Corrige em cópia do XML:
-      - remove CFOP quando categoria SVA e confiança >= threshold
+      - remove CFOP quando categoria SVA_* e confiança >= threshold
+      - insere/ajusta CFOP quando categoria SCM e PF/PJ não contrib e confiança >= threshold (5307/6307)
+      - (SCM contribuinte: NÃO mexe no CFOP)
       - paliativo desconto (vProd=vItem se vProd < vItem)
     """
     root = tree.getroot()
@@ -663,28 +770,60 @@ def simulate_and_or_correct_xml_nfcom(
     new_tree = etree.ElementTree(copy_root)
     ns = get_ns(new_tree)
 
-    # item -> (cat, conf)
     decisions = {int(r["item"]): (str(r["categoria_fiscal_ia"]), float(r["confianca_ia"])) for _, r in df_dec.iterrows()}
     dets = xp(copy_root, ns, ".//n:det | .//det")
-
     changes: List[Dict[str, Any]] = []
+
+    dest_nao_contrib = is_dest_pf_or_pj_nao_contrib(tree)
+    cfop_expected = expected_cfop_scm_pf(tree) if dest_nao_contrib else None
 
     for idx, det in enumerate(dets, start=1):
         cat, conf = decisions.get(idx, ("SVA_OUTROS", 0.0))
+        cat = (cat or "").strip()
+        conf = float(conf or 0.0)
 
-        # remover CFOP do SVA (conforme regra do escritório)
+        prod_nodes = xp(det, ns, "./n:prod | ./prod")
+        prod = prod_nodes[0] if prod_nodes else None
+
+        cfop_nodes = xp(det, ns, "./n:prod/n:CFOP | ./prod/CFOP")
+        cfop_text = (cfop_nodes[0].text or "").strip() if cfop_nodes else ""
+
+        # 1) SVA: remover CFOP (quando confiança suficiente)
         if cat.startswith("SVA_") and conf >= corr_auto_threshold:
-            cfop_nodes = xp(det, ns, "./n:prod/n:CFOP | ./prod/CFOP")
             if cfop_nodes:
-                old_cfop = (cfop_nodes[0].text or "").strip()
-                changes.append({"item": idx, "acao": "REMOVER_CFOP_SVA", "detalhe": f"Remover CFOP='{old_cfop}' (cat={cat}, conf={conf:.2f})"})
+                old_cfop = cfop_text
+                changes.append({
+                    "item": idx,
+                    "acao": "REMOVER_CFOP_SVA",
+                    "detalhe": f"Remover CFOP='{old_cfop}' (cat={cat}, conf={conf:.2f})"
+                })
                 if apply_changes:
                     for node in cfop_nodes:
                         parent = node.getparent()
                         if parent is not None:
                             parent.remove(node)
+                cfop_nodes = []
+                cfop_text = ""
 
-        # paliativo desconto
+        # 2) SCM: inserir/ajustar CFOP SOMENTE para PF/PJ não contribuinte
+        if cat == "SCM" and conf >= corr_auto_threshold and dest_nao_contrib and cfop_expected:
+            if (not cfop_text) or (cfop_text != cfop_expected):
+                changes.append({
+                    "item": idx,
+                    "acao": "AJUSTAR_CFOP_SCM",
+                    "detalhe": f"CFOP '{cfop_text or '(vazio)'}' -> '{cfop_expected}' (SCM PF/PJ não contrib, conf={conf:.2f})"
+                })
+                if apply_changes and prod is not None:
+                    if cfop_nodes:
+                        cfop_nodes[0].text = cfop_expected
+                    else:
+                        if ns and ns.get("n"):
+                            el = etree.SubElement(prod, f"{{{ns['n']}}}CFOP")
+                        else:
+                            el = etree.SubElement(prod, "CFOP")
+                        el.text = cfop_expected
+
+        # 3) paliativo desconto
         if corrigir_descontos:
             vitem_nodes = xp(det, ns, "./n:prod/n:vItem | ./prod/vItem")
             vprod_nodes = xp(det, ns, "./n:prod/n:vProd | ./prod/vProd")
@@ -694,7 +833,11 @@ def simulate_and_or_correct_xml_nfcom(
                 vi = to_float(vi_text)
                 vp = to_float(vp_text)
                 if vp < vi:
-                    changes.append({"item": idx, "acao": "AJUSTAR_VPROD", "detalhe": f"vProd {vp_text} -> {vi_text} (paliativo desconto)"})
+                    changes.append({
+                        "item": idx,
+                        "acao": "AJUSTAR_VPROD",
+                        "detalhe": f"vProd {vp_text} -> {vi_text} (paliativo desconto)"
+                    })
                     if apply_changes:
                         vprod_nodes[0].text = vi_text
 
@@ -723,12 +866,11 @@ def generate_excel_report(**dfs) -> bytes:
 # =========================
 # Processing ZIP streaming
 # =========================
-def decide_df_items(df_items: pd.DataFrame, client_cnpj: str, df_train: pd.DataFrame, enable_ai_items: bool, suggest_threshold: float) -> pd.DataFrame:
+def decide_df_items(df_items: pd.DataFrame, client_cnpj: str, df_train: pd.DataFrame, suggest_threshold: float) -> pd.DataFrame:
     """
     Decide categoria/confianca usando:
       - aprendizado (1.0)
-      - heurística
-    (Para lote grande, IA por item foi desativada aqui por padrão. A IA entra no consolidado.)
+      - heurística (descricao core)
     """
     df = df_items.copy()
 
@@ -746,10 +888,14 @@ def decide_df_items(df_items: pd.DataFrame, client_cnpj: str, df_train: pd.DataF
     def _final(r):
         if r["categoria_training"] in AI_ALLOWED:
             return pd.Series(["aprendizado", r["categoria_training"], 1.0, "Aprovado na base de aprendizado"])
-        # heurística
         cat = r["categoria_heur"]
         conf = float(r["confianca_heur"])
         mot = r["motivo_heur"]
+
+        # se heurística fraca, mantém SVA_OUTROS com conf menor (vai para revisão)
+        if conf < suggest_threshold:
+            return pd.Series(["heuristica", "SVA_OUTROS", conf, f"{mot} (abaixo do limiar; revisar no consolidado)"])
+
         if cat not in AI_ALLOWED:
             cat = "SVA_OUTROS"
         return pd.Series(["heuristica", cat, conf, mot])
@@ -862,7 +1008,6 @@ def process_zip_streaming(
                 "changes_count": 0,
             })
 
-            # libera
             del xml_bytes
             del tree
             gc.collect()
@@ -876,7 +1021,6 @@ def process_zip_streaming(
         df_items=df_items,
         client_cnpj=client_cnpj,
         df_train=df_train,
-        enable_ai_items=False,
         suggest_threshold=suggest_threshold,
     )
 
@@ -1002,9 +1146,10 @@ def main():
     )
 
     corr_auto_threshold = st.sidebar.slider(
-        "Limiar para remover CFOP do SVA (confiança mínima)",
+        "Limiar para correções automáticas (confiança mínima)",
         0.50, 1.00, 0.95, 0.01,
         key="thr_cfop",
+        help="Aplica: remover CFOP no SVA e inserir/ajustar CFOP 5307/6307 no SCM PF/PJ não contribuinte."
     )
 
     suggest_threshold = st.sidebar.slider(
@@ -1021,6 +1166,20 @@ def main():
         0.50, 1.00, 0.90, 0.01,
         key="ai_conf_min"
     )
+
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Diagnóstico IA (OpenAI)")
+    diag = openai_diag()
+    if not diag["openai_lib"]:
+        st.sidebar.error("Biblioteca 'openai' não carregou (requirements).")
+    elif not (diag["has_secret"] or diag["has_env"]):
+        st.sidebar.error("OPENAI_API_KEY não encontrada (Secrets/ENV).")
+    elif not diag["client_ok"]:
+        st.sidebar.error("OpenAI client não inicializou (ver logs).")
+    else:
+        st.sidebar.success("OpenAI OK (client inicializado).")
+    with st.sidebar.expander("Debug IA"):
+        st.sidebar.json(diag)
 
     # Base aprendizado
     st.sidebar.markdown("---")
@@ -1071,7 +1230,6 @@ def main():
             status.write("Finalizando estruturas de dados...")
             st.session_state["RESULTS"] = res
             status.update(label="Processamento concluído.", state="complete")
-        # libera o zip
         del zip_bytes
         gc.collect()
 
@@ -1145,16 +1303,33 @@ def main():
         vals = [str(v).strip() for v in series.dropna().unique().tolist() if str(v).strip()]
         return " | ".join(vals[:max_items]) if vals else ""
 
+    def _value_counts_top(series, topn=5):
+        vc = series.fillna("").astype(str).str.strip()
+        vc = vc[vc != ""].value_counts().head(topn)
+        if vc.empty:
+            return ""
+        return " | ".join([f"{k}:{int(v)}" for k, v in vc.items()])
+
+    def _cfop_fill_rate(series) -> float:
+        s = series.fillna("").astype(str).str.strip()
+        if len(s) == 0:
+            return 0.0
+        return float((s != "").sum() / len(s))
+
     df_consol = (
         df_base.groupby("desc_norm", as_index=False)
         .agg(
             descricao_exemplo=("descricao", "first"),
+            descricao_core=("descricao", lambda s: strip_noise_desc(s.iloc[0]) if len(s) else ""),
             categoria_sugerida=("categoria_fiscal_ia", "first"),
             confianca_min=("confianca_ia", "min"),
             qtd_ocorrencias=("desc_norm", "size"),
             total_vServ=("vServ", "sum"),
             cClass_distintos=("cClass", _join_unique),
+            cClass_top=("cClass", _value_counts_top),
             CFOP_distintos=("CFOP", _join_unique),
+            CFOP_top=("CFOP", _value_counts_top),
+            cfop_fill_rate=("CFOP", _cfop_fill_rate),
         )
     )
 
@@ -1164,6 +1339,10 @@ def main():
             with st.spinner("IA no consolidado..."):
                 df_ai = ai_classify_consolidated(df_consol, model=ai_model)
                 st.session_state["AI_CONSOL"] = df_ai
+
+            with st.expander("Debug IA (última resposta bruta)", expanded=False):
+                st.code(st.session_state.get("AI_LAST_RAW", ""), language="text")
+
     df_ai_last = st.session_state.get("AI_CONSOL")
     if isinstance(df_ai_last, pd.DataFrame) and not df_ai_last.empty:
         df_ai_last = df_ai_last[["desc_norm", "ia_sugestao", "ia_confianca", "ia_motivo"]].copy()
@@ -1175,10 +1354,7 @@ def main():
 
     # categoria aprovada (pré-preenche com IA quando conf alta)
     def _default_aprov(r):
-        try:
-            conf = float(r.get("ia_confianca", 0.0) or 0.0)
-        except Exception:
-            conf = 0.0
+        conf = safe_float(r.get("ia_confianca", 0.0), 0.0)
         sug = (r.get("ia_sugestao", "") or "").strip()
         if sug in AI_ALLOWED and conf >= ia_consol_min_conf:
             return sug
@@ -1186,16 +1362,28 @@ def main():
 
     df_consol["categoria_aprovada"] = df_consol.apply(_default_aprov, axis=1)
 
-    st.caption("Edite a coluna **categoria_aprovada** e aplique em massa (isso também salva no aprendizado).")
+    # Badge/colunas úteis
+    df_consol["cfop_%"] = (df_consol["cfop_fill_rate"].fillna(0.0) * 100.0).round(1)
+
+    st.caption("Edite **categoria_aprovada** e aplique em massa (salva no aprendizado e permite correção segura).")
     edited = st.data_editor(
         df_consol[
-            ["descricao_exemplo", "cClass_distintos", "CFOP_distintos", "qtd_ocorrencias", "total_vServ",
-             "categoria_sugerida", "ia_sugestao", "ia_confianca", "categoria_aprovada"]
+            [
+                "descricao_exemplo", "descricao_core",
+                "cClass_top", "cClass_distintos",
+                "CFOP_top", "CFOP_distintos",
+                "cfop_%", "qtd_ocorrencias", "total_vServ",
+                "categoria_sugerida", "ia_sugestao", "ia_confianca",
+                "categoria_aprovada"
+            ]
         ],
         use_container_width=True,
         num_rows="dynamic",
         column_config={
             "categoria_aprovada": st.column_config.SelectboxColumn("categoria_aprovada", options=CATEGORIES, required=True),
+            "cfop_%": st.column_config.NumberColumn("CFOP preenchido (%)", help="Percentual de ocorrências com CFOP preenchido"),
+            "total_vServ": st.column_config.NumberColumn("total_vServ"),
+            "qtd_ocorrencias": st.column_config.NumberColumn("qtd_ocorrencias"),
         },
         key="editor_consol",
     )
@@ -1230,7 +1418,6 @@ def main():
         if rows:
             training_append(rows)
 
-        # regrava no state e avisa para reprocessar correções em XML
         res["df_items"] = df_items2
         st.session_state["RESULTS"] = res
         st.success("Aprovações aplicadas ao dataframe. Para refletir nos XMLs, clique em **Regerar saídas** abaixo.")
@@ -1239,7 +1426,7 @@ def main():
     # Regerar saídas (corrigir XMLs) com base no df_items atual
     st.markdown("---")
     st.subheader("Regerar saídas (corrigidos/sugeridos) com base na classificação atual")
-    st.caption("Isso reabre os originais do disco e regrava os .out.xml. Seguro para lote grande (sem RAM alta).")
+    st.caption("Isso reabre os originais do disco e regrava os .out.xml (seguro para lote grande).")
     if st.button("Regerar saídas agora", key="btn_regerar"):
         out_dir = Path(get_workspace_dir(), "files")
         changes_all = []
@@ -1356,7 +1543,6 @@ def main():
     if "flag_cclass_1100101" in df_items.columns and df_items["flag_cclass_1100101"].any():
         df_alertas = df_items[df_items["flag_cclass_1100101"]].copy()
 
-    # Consolidados para Excel
     df_consol_excel = df_consol.copy()
     df_status = df_files[["arquivo","base_name","chave","changed","changes_count","orig_path","out_path"]].copy()
 
